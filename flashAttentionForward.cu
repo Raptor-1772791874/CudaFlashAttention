@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <mma.h>
+#include <cuda_fp16.h>
 #include <iostream>
 using  namespace nvcuda::wmma;
 
@@ -85,9 +86,9 @@ void launch_flash_atten_forward(
             int global_q_start=seq_start+(relative_chunk_idx*Block_Size);
             
             //先划定一个sharedMemory大小是多大，128个token128个维度
-            __shared__ float s_Q[Block_Size][Head_Dim];
-            __shared__ float s_K[Block_Size][Head_Dim];
-            __shared__ float s_V[Block_Size][Head_Dim];
+            __shared__ __half s_Q[Block_Size][Head_Dim];
+            __shared__ __half s_K[Block_Size][Head_Dim];
+            __shared__ __half s_V[Block_Size][Head_Dim];
             
 
             //并未在sharedmemory里，这是每个线程自己寄存器里的
