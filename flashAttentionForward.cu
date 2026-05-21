@@ -175,6 +175,7 @@ void launch_flash_atten_forward(
 
                     }
                 }
+            }
 
                 //必须统一停下等待全部的sharedmemory被填满拒绝脏读
                 __syncthreads();
@@ -183,8 +184,8 @@ void launch_flash_atten_forward(
                 //先分配任务，128*128/4为4个64*64，每个warp负责64个Q对K的打分点积。然后就是分时间线分碎块的搬了
                 //给128个线程分工，分为4个warp，各自负责最终S128，128里的64，64也就是把S分为一共4个碎片
                 int action_S_id =tid/32;
-                int action_row=tid /2;
-                int action_col=tid %2;
+                int action_row=action_S_id/2;
+                int action_col=action_S_id%2;
 
                 //计算每个块的起始比如warp0的id为0，row为0，col为0即代表它的矩阵的开始是从Q的0和K的0开始取的
                 int action_Q_offset=action_row*64;
@@ -246,6 +247,17 @@ void launch_flash_atten_forward(
                 
 
 
+
+
+
+
+
+
+
+
+
+
+
                 __syncthreads();
 
             }
@@ -254,7 +266,7 @@ void launch_flash_atten_forward(
         
         
 
-    }
+
 
 
 
@@ -266,9 +278,9 @@ void launch_flash_atten_forward(
         int  total_blocks = 0;
 
         for(int b=0;b<batchsize;++b){
-            int  seq_len=h_cu_seqlen_blocks[b+1]-h_cu_seqlen_blocks;
+            int  seq_len=h_cu_seqlen_blocks[b+1]-h_cu_seqlen_blocks[b];
             //即使只有一个token也要占据一整个block
-            int blocks_for_this_seq=(seq_len+Blcok_Size-1)/Blcok_Size;
+            int blocks_for_this_seq=(seq_len+Blcok_Size-1)/Block_Size;
 
             total_blocks+=blocks_for_this_seq;
             h_cu_seqlen_blocks[b+1]=total_blocks;
