@@ -171,7 +171,7 @@ void launch_flash_atten_forward(
                     }//如果越界还是填0，不允许不填（破坏了矩阵完整性宁愿计算无效值也要保证矩阵乘法时满足法则）
                     else{
                         s_K_f4[index]=make_float4(0.0f ,0.0f ,0.0f ,0.0f);
-                        s_V_f4[index]=make_float4(0.0f ,0,0f ,0,0f ,0,0f);
+                        s_V_f4[index]=make_float4(0.0f ,0.0f ,0.0f ,0.0f);
 
                     }
                 }
@@ -180,7 +180,19 @@ void launch_flash_atten_forward(
                 __syncthreads();
 
 
-                //算S矩阵了这下......
+                //先分配任务，128*128/4为4个64*64，每个warp负责64个Q对K的打分点积。然后就是分时间线分碎块的搬了
+                //给128个线程分工，分为4个warp，各自负责最终S128，128里的64，64也就是把S分为一共4个碎片
+                int action_S_id =tid/32;
+                int action_row=tid /2;
+                int action_col=tid %2;
+
+                //计算每个块的起始比如warp0的id为0，row为0，col为0即代表它的矩阵的开始是从Q的0和K的0开始取的
+                int action_Q_offset=action_row*64;
+                int action_K_offset=action_col*64;
+
+
+
+                //正经算S矩阵了这下......
 
                 //先声明FragS在线程寄存器里
                 wmma::fragment<wmma::accumulator,16,16,16,float>frag_S[4][4];
@@ -200,24 +212,25 @@ void launch_flash_atten_forward(
 
 
                 wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> frag_Q[4];
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> frag_K[4];
+                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> frag_K[4];/*虽然K矩阵是行主序存在内存里但是sgemm时用的是转置的（为了满足matrix mutiply的规则
+                                                                                       这里0开销仅通过申明列主序类型就完成了假装转置（Tensor Core还是会顺着读但当成一列）*/
 
                 /*时间线推进放在最外面，是因为fragS层面其他格子可以有数据的复用虽然单个fragS格子用不着
                 为啥是8次因为一次只能算16个token的16个维度*具体见补_充_2*/
                 #pragma unroll
                 for(int t_step=0;t_step<8;++t_step){
 
-                   //固定好SRAM大小，为128
+                   //固定好SRAM大小，为128，也可以直接复用一个头的大小已在宏定义写好改为Head_Dim即可
                     const int Stride_Sram=128;
 
                     #pragma unroll
                     for(int i=0;i<4;++i){
-                        wmma::load_matrix_sync(frag_Q[i],s_Q+i*16*Stride_Sram+t_step*16,Stride_Sram);
+                        wmma::load_matrix_sync(frag_Q[i],s_Q+(action_Q_offset+i*16)*Stride_Sram+t_step*16,Stride_Sram);//偏移公式看白皮书的版本1一页
                     }
 
                     #pragma unroll
                     for(int j=0;j<4;++j){
-                        wmma::load_matrix_sync(frag_K[j],s_K+j*16*Stride_Sram+t_step*16,Stride_Sram);
+                        wmma::load_matrix_sync(frag_K[j],s_K+(action_K_offset+j*16)*Stride_Sram+t_step*16,Stride_Sram);
                     }
 
                     #pragma unroll
