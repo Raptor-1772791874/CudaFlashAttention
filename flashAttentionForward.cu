@@ -180,6 +180,11 @@ void launch_flash_atten_forward(
                 //必须统一停下等待全部的sharedmemory被填满拒绝脏读
                 __syncthreads();
 
+                //gcc犯蠢会把2维数组的首元素直接当作一整行的大小的偏移，下面把S_Q,S_K重新换成步长为1个half类型否则越界
+
+                half* float_S_Q=&S_Q[0][0];
+                half* float_S_K=&S_K[0][0];
+
 
                 //先分配任务，128*128/4为4个64*64，每个warp负责64个Q对K的打分点积。然后就是分时间线分碎块的搬了
                 //给128个线程分工，分为4个warp，各自负责最终S128，128里的64，64也就是把S分为一共4个碎片
@@ -226,12 +231,12 @@ void launch_flash_atten_forward(
 
                     #pragma unroll
                     for(int i=0;i<4;++i){
-                        wmma::load_matrix_sync(frag_Q[i],s_Q+(action_Q_offset+i*16)*Stride_Sram+t_step*16,Stride_Sram);//偏移公式看白皮书的版本1一页
+                        wmma::load_matrix_sync(frag_Q[i],float_S_Ks_Q+(action_Q_offset+i*16)*Stride_Sram+t_step*16,Stride_Sram);//偏移公式看白皮书的版本1一页
                     }
 
                     #pragma unroll
                     for(int j=0;j<4;++j){
-                        wmma::load_matrix_sync(frag_K[j],s_K+(action_K_offset+j*16)*Stride_Sram+t_step*16,Stride_Sram);
+                        wmma::load_matrix_sync(frag_K[j],float_S_K+(action_K_offset+j*16)*Stride_Sram+t_step*16,Stride_Sram);
                     }
 
                     #pragma unroll
