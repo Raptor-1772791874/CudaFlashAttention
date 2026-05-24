@@ -15,7 +15,7 @@ void launch_flash_atten_forward(
     int* cu_seqlens,
     int* cu_seqlen_blocks,
     int total_tokens,
-    int total_blocks
+    int total_blocks,
     int num_heads,
     cudaStream_t stream){
 
@@ -182,8 +182,8 @@ void launch_flash_atten_forward(
 
                 //gcc犯蠢会把2维数组的首元素直接当作一整行的大小的偏移，下面把S_Q,S_K重新换成步长为1个half类型否则越界
 
-                half* float_S_Q=&S_Q[0][0];
-                half* float_S_K=&S_K[0][0];
+                half* float_S_Q=&s_Q[0][0];
+                half* float_S_K=&s_K[0][0];
 
 
                 //先分配任务，128*128/4为4个64*64，每个warp负责64个Q对K的打分点积。然后就是分时间线分碎块的搬了
@@ -231,7 +231,7 @@ void launch_flash_atten_forward(
 
                     #pragma unroll
                     for(int i=0;i<4;++i){
-                        wmma::load_matrix_sync(frag_Q[i],float_S_Ks_Q+(action_Q_offset+i*16)*Stride_Sram+t_step*16,Stride_Sram);//偏移公式看白皮书的版本1一页
+                        wmma::load_matrix_sync(frag_Q[i],float_S_Q+(action_Q_offset+i*16)*Stride_Sram+t_step*16,Stride_Sram);//偏移公式看白皮书的版本1一页
                     }
 
                     #pragma unroll
@@ -285,7 +285,7 @@ void launch_flash_atten_forward(
         for(int b=0;b<batchsize;++b){
             int  seq_len=h_cu_seqlen_blocks[b+1]-h_cu_seqlen_blocks[b];
             //即使只有一个token也要占据一整个block
-            int blocks_for_this_seq=(seq_len+Blcok_Size-1)/Block_Size;
+            int blocks_for_this_seq=(seq_len+Block_Size-1)/Block_Size;
 
             total_blocks+=blocks_for_this_seq;
             h_cu_seqlen_blocks[b+1]=total_blocks;
