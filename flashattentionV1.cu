@@ -117,7 +117,10 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                     // 越界区域直接填 0，防止脏数据污染后续的点积
                     s_Q_f4[index] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                 }
-            } // for 循环结束
+                
+                
+            } 
+            // for 循环结束
 
             // 绝对同步屏障：Q 矩阵已经分块全部躺在 SRAM 里了，必须等 128 个人全部搬完！
             __syncthreads();
@@ -155,16 +158,10 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
 
                     }
                 }
-            }
-
                 //必须统一停下等待全部的sharedmemory被填满拒绝脏读
                 __syncthreads();
 
                 //gcc犯蠢会把2维数组的首元素直接当作一整行的大小的偏移，下面把S_Q,S_K重新换成步长为1个half类型否则越界
-
-    
-
-
                 //先分配任务，128*128/4为4个64*64，每个warp负责64个Q对K的打分点积。然后就是分时间线分碎块的搬了
                 //给128个线程分工，分为4个warp，各自负责最终S128，128里的64，64也就是把S分为一共4个碎片
                 int action_S_id =tid/32;
@@ -252,7 +249,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                                 int local_row=i*16;
                                 int local_col=action_col*64+j*16;
 
-                                float* target_ptr=s_S_reduce+local_row*128+local_cal;
+                                float* target_ptr=s_S_reduce+local_row*128+local_col;
 
 
                                 wmma::store_matrix_sync(target_ptr,frag_S[i][j],128,wmma::mem_row_major);
@@ -285,45 +282,30 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                 int global_row=phase*64+row_idx;
                 for(int a=0;a<128;++a){
                     float p_val=my_row[a]/row_sum;
-                    s_dump[global_row*128+c]=p_val;
+                    s_dump[global_row*128+a]=p_val;
                 }
             }
-            __syncthrads();
+            __syncthreads();
 
             return;
-               
-            
-            
-            
-            
-            
-            
-            
-            
-            }
+               }
+
+                
+}
 
                
 
 
-                
-
-                
-
-
-
-
-
-
-
-
+            
 
 
 
 
 
                 __syncthreads();
+}
 
-            }
+
 
 
             void launch_flash_atten_forward(
