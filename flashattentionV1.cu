@@ -232,6 +232,8 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                 float* s_S_reduce=reinterpret_cast<float*>(s_K_ptr);
 
                 //时间线推进2次，由于规约的时候需要全部的维度在场所以我们选择让同一行的一起规约
+
+                const float scale_factor =1.0f/sqrtf(128.0f);
                 
                 #pragma unroll
                 for(int phase=0;phase<2;++phase){
@@ -260,7 +262,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                     __syncthreads();
 
 
-                    //OnlineSoftMax开始，一个线程负责一行的数据
+                    //OnlineSoftMax开始，一个线程负责一行的数据（目前是三次标准soft Max）
 
 
                     if(tid<64){
@@ -269,7 +271,8 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
 
                 float row_max=-INFINITY;
                 for(int a=0;a<128;++a){
-                    row_max=fmax(row_max,my_row[a]);
+                    my_row[a] *=scale_factor;
+                    row_max=fmaxf(row_max,my_row[a]);
                 }
 
                 float row_sum=0.0f;
@@ -287,8 +290,9 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
             }
             __syncthreads();
 
-            return;
+            
                }
+               return;
 
                 
 }
