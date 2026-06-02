@@ -31,6 +31,18 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
             int  head_idx=blockIdx.z;   //负责哪个头（32之一）
             int tid=threadIdx.x;       //我的工号是多少（负责128个token里的具体哪一个）
 
+//原本这段在kchunk内但由于最后用到了所以我移到最开头来避免作用域不全
+            //先分配任务，128*128/4为4个64*64，每个warp负责64个Q对K的打分点积。然后就是分时间线分碎块的搬了
+                //给128个线程分工，分为4个warp，各自负责最终S128，128里的64，64也就是把S分为一共4个碎片
+                int action_S_id =tid/32;
+                int action_row=action_S_id/2;
+                int action_col=action_S_id%2;
+
+                //计算每个块的起始比如warp0的id为0，row为0，col为0即代表它的矩阵的开始是从Q的0和K的0开始取的
+                int action_Q_offset=action_row*64;
+                int action_K_offset=action_col*64;
+
+
 
             
             //常规的写法是让一个线程负责一个token的1个维度，在此处我们让一个线程负责了一个token的128维度
@@ -124,7 +136,18 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
 
             // 绝对同步屏障：Q 矩阵已经分块全部躺在 SRAM 里了，必须等 128 个人全部搬完！
             __syncthreads();
+
+            //O必须在kchunk之外存在
                 
+            wmma::fragment<wmma::accumulator,16,16,16,float> frag_O[4][4];
+
+               #pragma unroll
+               for(int i=0;i<4;++i){
+                #pragma unroll
+                for(int j=0;j<4;++j){
+                    wmma::fill_fragment(frag_O[i][j],0.0f);
+                }
+               }
 
             for(int k_chunk_start=seq_start;k_chunk_start<seq_end;k_chunk_start+=Block_Size){
                 //重新寻找KV的开头的地址，globalqstart是大循环外面求的而且有Q的血如果用它每一次小循环转动都会重新计算巨大的地址偏移
@@ -161,17 +184,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                 //必须统一停下等待全部的sharedmemory被填满拒绝脏读
                 __syncthreads();
 
-                //gcc犯蠢会把2维数组的首元素直接当作一整行的大小的偏移，下面把S_Q,S_K重新换成步长为1个half类型否则越界
-                //先分配任务，128*128/4为4个64*64，每个warp负责64个Q对K的打分点积。然后就是分时间线分碎块的搬了
-                //给128个线程分工，分为4个warp，各自负责最终S128，128里的64，64也就是把S分为一共4个碎片
-                int action_S_id =tid/32;
-                int action_row=action_S_id/2;
-                int action_col=action_S_id%2;
-
-                //计算每个块的起始比如warp0的id为0，row为0，col为0即代表它的矩阵的开始是从Q的0和K的0开始取的
-                int action_Q_offset=action_row*64;
-                int action_K_offset=action_col*64;
-
+                
 
 
                 //正经算S矩阵了这下......
@@ -234,6 +247,11 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                 //时间线推进2次，由于规约的时候需要全部的维度在场所以我们选择让同一行的一起规约
 
                 const float scale_factor =1.0f/sqrtf(128.0f);
+
+
+                //提前声明出PV矩阵
+                wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>frag_P[4];
+               wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major>frag_V[4];
                 
                 #pragma unroll
                 for(int phase=0;phase<2;++phase){
@@ -241,73 +259,124 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                     //检查轮到哪个Warp上场
                     //action_row==0 表示Warp01上场   ,action_row==1  表示Warp23上场
 
-                    bool is_my_time =(action_row==phase);
+                    bool is_my_time = (action_row == phase);
 
+                    // --- 1. S_reduce 砸盘 ---
                     if(is_my_time){
                         #pragma unroll
-                        for(int i=0;i<4;++i){
+                        for(int i=0; i<4; ++i){
                             #pragma unroll
-                            for(int j=0;j<4;++j){
-                                int local_row=i*16;
-                                int local_col=action_col*64+j*16;
-
-                                float* target_ptr=s_S_reduce+local_row*128+local_col;
-
-
-                                wmma::store_matrix_sync(target_ptr,frag_S[i][j],128,wmma::mem_row_major);
+                            for(int j=0; j<4; ++j){
+                                int local_row = i * 16;
+                                int local_col = action_col * 64 + j * 16;
+                                wmma::store_matrix_sync(s_S_reduce + local_row * 128 + local_col, frag_S[i][j], 128, wmma::mem_row_major);
                             }
                         }
                     }
-                    //先一步做完的给我停着等其他人全部落齐了才行也就是凑满64，128后才走
-                    __syncthreads();
+                    __syncthreads(); // 屏障1：等所有人砸完S
+
+                    // --- 2. Softmax 与 寄存器防线 ---
+                    if(is_my_time){
+                        // 注意：这里退化回 0~63，两拨人交替使用 SRAM 的前 16KB！
+                        int local_row_idx = tid - (phase * 64);
+                        float* my_row = s_S_reduce + local_row_idx * 128;
+                        float row_max = -INFINITY;
+
+                        for(int a=0; a<128; ++a){
+                            my_row[a] *= scale_factor;
+                            row_max = fmaxf(row_max, my_row[a]);
+                        }
+
+                        float row_sum = 0.0f;
+                        for(int a=0; a<128; ++a){
+                            float exp_val = expf(my_row[a] - row_max);
+                            my_row[a] = exp_val;
+                            row_sum += exp_val;
+                        }
+
+                        // 寄存器墙：防止同 Warp 内线程前后踩踏
+                        half p_temp[128];
+                        #pragma unroll 4
+                        for(int a=0; a<128; ++a){
+                            p_temp[a] = __float2half(my_row[a] / row_sum);
+                        }
+
+                        // 直接写回前 16KB 领地
+                        #pragma unroll 4
+                        for(int a=0; a<128; ++a){
+                            s_K_ptr[local_row_idx * 128 + a] = p_temp[a];
+                        }
+                    }
+                    __syncthreads(); // 屏障2：等P矩阵安全写完
+
+                    // --- 3. 💥 趁热打铁：当场执行 P*V 张量轰炸 ---
+                    if(is_my_time){
+                        #pragma unroll
+                        for(int t_step=0; t_step<8; ++t_step){
+                            #pragma unroll
+                            for(int i=0; i<4; ++i){
+                                // 核心密码：此时 P 永远躺在 s_K_ptr 的最开头！
+                                wmma::load_matrix_sync(frag_P[i], s_K_ptr + (i * 16) * 128 + t_step * 16, 128);
+                            }
+                            
+                            #pragma unroll
+                            for(int j=0; j<4; ++j){
+                                // V 的读取雷打不动
+                                wmma::load_matrix_sync(frag_V[j], s_V_ptr + (action_col * 64 + j * 16) + t_step * 16 * 128, 128);
+                            }
+                            
+                            #pragma unroll
+                            for(int i=0; i<4; ++i){
+                                #pragma unroll
+                                for(int j=0; j<4; ++j){
+                                    wmma::mma_sync(frag_O[i][j], frag_P[i], frag_V[j], frag_O[i][j]);
+                                }
+                            }
+                        }
+                    }
+                    __syncthreads(); // 屏障3：等P*V算完，再进入下一轮，防止下个Phase的FP32冲刷SRAM！
+
+                    
+        }//K循环边界
 
 
-                    //OnlineSoftMax开始，一个线程负责一行的数据（目前是三次标准soft Max）
+        //写回显存，卸磨杀驴，在单个block的情况下可以复用Q了，回到第64行写的smem[]
+        float* s_O_dump=reinterpret_cast<float*>(smem);
 
-
-                    if(tid<64){
-                int row_idx=tid;  //找行号64的
-                float* my_row=s_S_reduce+row_idx*128;
-
-                float row_max=-INFINITY;
-                for(int a=0;a<128;++a){
-                    my_row[a] *=scale_factor;
-                    row_max=fmaxf(row_max,my_row[a]);
-                }
-
-                float row_sum=0.0f;
-                for(int a=0;a<128;++a){
-                    float exp_val =expf(my_row[a]-row_max);
-                    my_row[a]=exp_val;
-                    row_sum+=exp_val;
-                }
-
-                int global_row=phase*64+row_idx;
-                for(int a=0;a<128;++a){
-                    float p_val=my_row[a]/row_sum;
-                    s_dump[global_row*128+a]=p_val;
-                }
+        #pragma unroll
+        for(int i=0;i<4;++i){
+            #pragma unroll
+            for(int j=0;j<4;++j){
+                int local_row=action_row*64+i*16;
+                int local_col=action_col*64+j*16;
+                wmma::store_matrix_sync(s_O_dump+local_row*128+local_col,frag_O[i][j],128,wmma::mem_row_major);
             }
-            __syncthreads();
+        }
 
-            
-               }
-               return;
+        __syncthreads();
+
+
+        if(tid<128){
+            int current_global_token=global_q_start+tid;
+
+            if(current_global_token<seq_end){
+                int global_O_idx =current_global_token *(num_heads*Head_Dim)+(head_idx*Head_Dim);
+                half* O_target =O+global_O_idx;
+                float* O_source =s_O_dump+tid*128;
 
                 
-}
+                #pragma unroll
+                for(int col=0;col<128;++col){
+                    O_target[col]=__float2half(O_source[col]);
+                }
+            }
+        }
 
                
 
 
-            
-
-
-
-
-
                 __syncthreads();
-}
+}}
 
 
 
@@ -395,7 +464,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
     );
 
     cudaDeviceSynchronize();
-    return S_dump;
+    return O;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
