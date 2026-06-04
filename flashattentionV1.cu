@@ -31,14 +31,14 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
             int  head_idx=blockIdx.z;   //负责哪个头（32之一）
             int tid=threadIdx.x;       //我的工号是多少（负责128个token里的具体哪一个）
 
-//原本这段在kchunk内但由于最后用到了所以我移到最开头来避免作用域不全
+//原本这段在kchunk内但由于kchunk循环外在最后搬回显存时用到了，所以我移到最开头来避免作用域和生命周期不全
             //先分配任务，128*128/4为4个64*64，每个warp负责64个Q对K的打分点积。然后就是分时间线分碎块的搬了
                 //给128个线程分工，分为4个warp，各自负责最终S128，128里的64，64也就是把S分为一共4个碎片
                 int action_S_id =tid/32;
                 int action_row=action_S_id/2;
                 int action_col=action_S_id%2;
 
-                //计算每个块的起始比如warp0的id为0，row为0，col为0即代表它的矩阵的开始是从Q的0和K的0开始取的
+                //计算每个块的起始比如warp0的S_id为0，所以row为0，而col也为0即代表它的矩阵的开始是从Q的0和K的0开始取的
                 int action_Q_offset=action_row*64;
                 int action_K_offset=action_col*64;
 
@@ -261,47 +261,53 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
 
                     bool is_my_time = (action_row == phase);
 
-                    // --- 1. S_reduce 砸盘 ---
+                    
                     if(is_my_time){
                         #pragma unroll
                         for(int i=0; i<4; ++i){
                             #pragma unroll
                             for(int j=0; j<4; ++j){
                                 int local_row = i * 16;
-                                int local_col = action_col * 64 + j * 16;
-                                wmma::store_matrix_sync(s_S_reduce + local_row * 128 + local_col, frag_S[i][j], 128, wmma::mem_row_major);
+                                int local_col = action_col * 64 + j * 16;//actioncol可以代替专门给从64-127列的线程写一个+64偏移的语句
+                                float* target_ptr=s_S_reduce+local_row*128+local_col;//算真实的地址起始（从SKptr开始）
+                                wmma::store_matrix_sync(target_ptr, frag_S[i][j], 128, wmma::mem_row_major);
                             }
                         }
                     }
-                    __syncthreads(); // 屏障1：等所有人砸完S
+                    __syncthreads(); //先一步做完的给我停着等其他人全部落齐了才行也就是凑满64，128后才走
 
-                    // --- 2. Softmax 与 寄存器防线 ---
+                    // 三次标准Softmax 与 寄存器防线
+
+                    //由于分上下半场且我们是让同一actionrow的wrap工作的（即同64行），所以让一个线程负责1行128个s打分数据
                     if(is_my_time){
                         // 注意：这里退化回 0~63，两拨人交替使用 SRAM 的前 16KB！
-                        int local_row_idx = tid - (phase * 64);
-                        float* my_row = s_S_reduce + local_row_idx * 128;
+                        int local_row_idx = tid - (phase * 64); //用is my time2元对立巧妙的让不在场的warp不工作，但上下半场都用的同一SK地址
+                        float* my_row = s_S_reduce + local_row_idx * 128;  //定位到每个线程负责的行的开始，从SK首地址开始算偏移
                         float row_max = -INFINITY;
 
                         for(int a=0; a<128; ++a){
-                            my_row[a] *= scale_factor;
-                            row_max = fmaxf(row_max, my_row[a]);
+                            my_row[a] *= scale_factor; //清洗数据做梯度消失的防爆处理，避免数值分布极度分散方差过大
+                            row_max = fmaxf(row_max, my_row[a]); //找每行最大
                         }
 
                         float row_sum = 0.0f;
                         for(int a=0; a<128; ++a){
-                            float exp_val = expf(my_row[a] - row_max);
-                            my_row[a] = exp_val;
-                            row_sum += exp_val;
+                            /*即使有了梯度防爆，但极深的神经网络中还是有可能面临大数据
+                            假设S为1000，在scale（约为11.3）后约为100，如果不减去最大会直接变为e的100次方，撑爆数据类型的上限*/
+                            float exp_val = expf(my_row[a] - row_max);//soft Max中的数据保底防爆
+                            my_row[a] = exp_val;//把原S更换为上面做了防爆处理的数值。
+                            row_sum += exp_val;//出来把每行的数值加一起，一共循环128次
                         }
 
-                        // 寄存器墙：防止同 Warp 内线程前后踩踏
+                        //在baseline original中我们下面是直接把数据写回去SK内存去了，但这会造成数据踩踏内存竞争污染
+                        // 寄存器墙：防止同 Warp 内线程前后踩踏，但此时寄存器早已溢出。
                         half p_temp[128];
                         #pragma unroll 4
                         for(int a=0; a<128; ++a){
                             p_temp[a] = __float2half(my_row[a] / row_sum);
                         }
 
-                        // 直接写回前 16KB 领地
+                        // 直接写回SK PTR的32kb内存去
                         #pragma unroll 4
                         for(int a=0; a<128; ++a){
                             s_K_ptr[local_row_idx * 128 + a] = p_temp[a];
@@ -309,20 +315,23 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                     }
                     __syncthreads(); // 屏障2：等P矩阵安全写完
 
-                    // --- 3. 💥 趁热打铁：当场执行 P*V 张量轰炸 ---
+                    // 趁热打铁直接执行 P*V 在Tensor Core里
+
+                    //与算S时采用的同一种套路让1鱼4吃，用t_step充当时间线循环8次，利用外积重叠解决P*V
                     if(is_my_time){
                         #pragma unroll
                         for(int t_step=0; t_step<8; ++t_step){
                             #pragma unroll
                             for(int i=0; i<4; ++i){
-                                // 核心密码：此时 P 永远躺在 s_K_ptr 的最开头！
+                                //此时 P 永远躺在 s_K_ptr 的最开头！
                                 wmma::load_matrix_sync(frag_P[i], s_K_ptr + (i * 16) * 128 + t_step * 16, 128);
                             }
                             
                             #pragma unroll
                             for(int j=0; j<4; ++j){
-                                // V 的读取雷打不动
-                                wmma::load_matrix_sync(frag_V[j], s_V_ptr + (action_col * 64 + j * 16) + t_step * 16 * 128, 128);
+                                // V 的读取是128行64列，P是64行128列
+                                //warp0负责的是0-64列的V，warp1负责的是64-127列的V
+                                wmma::load_matrix_sync(frag_V[j], s_V_ptr + (t_step * 16 * 128)+(action_col * 64 + j * 16) , 128);
                             }
                             
                             #pragma unroll
@@ -337,7 +346,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                     __syncthreads(); // 屏障3：等P*V算完，再进入下一轮，防止下个Phase的FP32冲刷SRAM！
 
                     
-        }//K循环边界
+        }//phase循环边界
 
 
         //写回显存，卸磨杀驴，在单个block的情况下可以复用Q了，回到第64行写的smem[]
@@ -376,7 +385,9 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
 
 
                 __syncthreads();
-}}
+}//k循环边界
+
+}
 
 
 
