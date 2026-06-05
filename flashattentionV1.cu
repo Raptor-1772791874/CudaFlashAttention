@@ -63,12 +63,12 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
             int seq_start =cu_seqlens[batch_idx];//起点为100
             int seq_end =cu_seqlens[batch_idx+1];//终点为350
 
-            //计算我是这个用户的第几个block？
+            //计算我是这个用户的第几个block？（以用户的block个数为背景）
             int relative_chunk_idx=q_chunk_idx-cu_seqlens_blocks[batch_idx];
 
             //用第几个block乘以大小后这里才是线程负责的token所在的全规格矩阵里第一个token全局起点（此背景是全局偏移且是4096开头）
-            //接上，意思是它没有走到自己负责的头的真实地址上还要写偏移公式。
-            int global_q_start=seq_start+(relative_chunk_idx*Block_Size);//在Q的全局偏移背景下
+            //接上，意思是它没有走到自己负责的头的真实地址上只走到了自己所在的block离用户起点的偏移，还要继续算偏移。
+            int global_q_start=seq_start+(relative_chunk_idx*Block_Size);//在Q的Block级全局偏移背景下。算当前线程负责哪个block里的token
             
             //先划定一个sharedMemory大小是多大，128个token128个维度
             
@@ -317,7 +317,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
 
                     // 趁热打铁直接执行 P*V 在Tensor Core里
 
-                    //与算S时采用的同一种套路让1鱼4吃，用t_step充当时间线循环8次，利用外积重叠解决P*V
+                    //与算S时采用的同一种套路让1鱼4吃寄存器级复用，用t_step充当时间线循环8次累加答案，利用外积重叠解决P*V的维度不满128的问题
                     if(is_my_time){
                         #pragma unroll
                         for(int t_step=0; t_step<8; ++t_step){
@@ -343,51 +343,60 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                             }
                         }
                     }
-                    __syncthreads(); // 屏障3：等P*V算完，再进入下一轮，防止下个Phase的FP32冲刷SRAM！
+                    __syncthreads(); // 屏障3：等半场的P*V算完，再进入下一轮，防止下个Phase的FP32进来覆盖掉上半场算的P
 
                     
         }//phase循环边界
 
 
-        //写回显存，卸磨杀驴，在单个block的情况下可以复用Q了，回到第64行写的smem[]
+        //写回显存，卸磨杀驴，在单个block的情况下可以复用Q了，回到第64行写的smem[]那里引用
+
+        //不直接写回显存是因为不知道wmma底层如何进行lane映射的，无法达到访存合并。
         float* s_O_dump=reinterpret_cast<float*>(smem);
 
         #pragma unroll
         for(int i=0;i<4;++i){
             #pragma unroll
             for(int j=0;j<4;++j){
+                /*与搬运S时的逻辑一模一样，直接复用actionnrow，col即可
+                warp0同样负责O的前64行和64列，且它的rowcol都是0也一样表示从0开始搬，其他warp同理*/
                 int local_row=action_row*64+i*16;
                 int local_col=action_col*64+j*16;
                 wmma::store_matrix_sync(s_O_dump+local_row*128+local_col,frag_O[i][j],128,wmma::mem_row_major);
             }
         }
+        //这里搬回去时也完美32way bank conflict了
 
         __syncthreads();
+        //老规矩集合，等4个warp所有人都搬完了才开始下一步。
 
 
         if(tid<128){
+            //计算当前线程是否超出用户的有效token数
+            //globalqstart表示当前线程在用户中所属block的起点加tid就是算在这个block里负责用户的哪个token
+            //详情看写2
             int current_global_token=global_q_start+tid;
 
             if(current_global_token<seq_end){
                 int global_O_idx =current_global_token *(num_heads*Head_Dim)+(head_idx*Head_Dim);
-                half* O_target =O+global_O_idx;
-                float* O_source =s_O_dump+tid*128;
+                //要偏移其他token的步长（32个头每个128维度）和自己token里的其他头
+                half* O_target =O+global_O_idx;//算显存的偏移
+                float* O_source =s_O_dump+tid*128;//算在Smem里的偏移
 
                 
                 #pragma unroll
                 for(int col=0;col<128;++col){
+                    //将Smem里的数拿出强转为半精度放回显存
+                    //这里完美32wayBankconflict和访存不合并了因为一个线程负责一个token的128维度的搬运，则32个线程跨步非常大
                     O_target[col]=__float2half(O_source[col]);
                 }
             }
         }
-
-               
-
-
+              
                 __syncthreads();
 }//k循环边界
 
-}
+}//核函数边界
 
 
 
@@ -468,7 +477,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
         smem_size
     );
 
-    // 启动机甲
+    // 启动核函数
     flash_atten_kernel<<<grid, block,smem_size>>>(
         q_ptr, k_ptr, v_ptr, o_ptr, s_dump_ptr,
         seqlens_ptr, blocks_ptr, total_tokens, num_heads
