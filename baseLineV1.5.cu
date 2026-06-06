@@ -25,7 +25,8 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
         const int* __restrict__ cu_seqlens,
         const int* __restrict__ cu_seqlens_blocks,
         int total_tokens,
-        int num_heads){
+        int num_heads,
+    int num_batches){
 
             int q_chunk_idx=blockIdx.x; //线程属于第几个切块的包工队（一个包工队负责128个token）
             int  head_idx=blockIdx.z;   //负责哪个头（32之一）
@@ -52,12 +53,23 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
             所以一个block里可能参杂了两个用户甚至多个
             所以我们必须要查一个前缀和用户token的数组来找到当前线程到底负责哪个用户*/
 
+            int left = 0;
+            int right = num_batches - 1; 
+            int batch_idx = 0;
 
             int batch_idx =0;
-            /*  用2分查找节省时间，此处暂用线性查找后续再优化
+            /*  用2分查找节省时间
             假设前缀和数组是[0,100,350],如果我的起点是150我会找到batch1*/
             while(cu_seqlens_blocks[batch_idx+1]<=q_chunk_idx){
-                batch_idx++;
+                // 右移位运算替代除法指令，直接在 ALU 层面完成降维
+                int mid = left + ((right - left) >> 1); 
+                
+                if (cu_seqlens_blocks[mid] <= q_chunk_idx) {
+                    batch_idx = mid;     // 记录当前合法的最大批次索引
+                    left = mid + 1;      // 继续向右侧显存域逼近
+                } else {
+                    right = mid - 1;     // 收缩左侧显存域
+                }
             }
             //找到当前用户的合法边界
             int seq_start =cu_seqlens[batch_idx];//起点为100
@@ -409,6 +421,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
     int total_tokens,
     int total_blocks,
     int num_heads,
+    int num_batches,
     cudaStream_t stream){
 
         int smem_size = 3 * 128 * 128 * sizeof(half); 
@@ -434,7 +447,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
         如果是Tensor Core那要改写32，4的形态*/
         dim3 block(Block_Size);
 
-        flash_atten_kernel<<<grid,block,smem_size,stream>>>(Q,K,V,O,s_dump,cu_seqlens,cu_seqlen_blocks,total_tokens,num_heads);
+        flash_atten_kernel<<<grid,block,smem_size,stream>>>(Q,K,V,O,s_dump,cu_seqlens,cu_seqlen_blocks,total_tokens,num_heads,num_batches);
           
         //全部停下来等待
        cudaDeviceSynchronize();
@@ -450,6 +463,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
 {
     int total_tokens = Q.size(0);
     int num_heads = Q.size(1);
+    int num_batches = cu_seqlens.size(0) - 1;//前缀和数组
     
     // 初始化 O 矩阵 (目前用不到，但为了凑齐参数)
     auto O = torch::empty_like(Q);
@@ -480,7 +494,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
     // 启动核函数
     flash_atten_kernel<<<grid, block,smem_size>>>(
         q_ptr, k_ptr, v_ptr, o_ptr, s_dump_ptr,
-        seqlens_ptr, blocks_ptr, total_tokens, num_heads
+        seqlens_ptr, blocks_ptr, total_tokens, num_heads,num_batches
     );
 
     //测性能时把Device Sync给注释掉不要执行
