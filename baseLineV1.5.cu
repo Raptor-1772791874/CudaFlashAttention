@@ -28,7 +28,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
         int num_heads,
     int num_batches){
 
-            int q_chunk_idx=blockIdx.x; //线程属于第几个切块的包工队（一个包工队负责128个token）
+            int q_chunk_idx=blockIdx.x; //线程属于第几个block（不是每个用户，以全局block来算的）（一个包工队负责128个token）
             int  head_idx=blockIdx.z;   //负责哪个头（32之一）
             int tid=threadIdx.x;       //我的工号是多少（负责128个token里的具体哪一个）
 
@@ -94,11 +94,11 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
             
 
             //并未在sharedmemory里，这是每个线程自己寄存器里的
-            //float m_old=-INFINITY; //历史最大王
-            //float l_old=0.0f;      //历史指数和（目前为0）
+            float m_old=-INFINITY; //历史最大王
+            float l_old=0.0f;      //历史指数和（目前为0）
             
             //用来装最终的累加器O_local，这个线程负责当前词的128个维度所以开了一个一维数组存
-            //float o_local[Head_Dim]={0.0f};
+            float o_local[Head_Dim]={0.0f};
 
             //一个float4任务可以搬16个字节即8个half数据所以除8
             const int f4_stride=Head_Dim/8;
@@ -161,7 +161,9 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                 }
                }
 
+               //kv循环无需显式写循环两次，因为这里由start到end就是256个token而一次循环会搬运128个token完成一次直接跳过128个token。
             for(int k_chunk_start=seq_start;k_chunk_start<seq_end;k_chunk_start+=Block_Size){
+                
                 //重新寻找KV的开头的地址，globalqstart是大循环外面求的而且有Q的血如果用它每一次小循环转动都会重新计算巨大的地址偏移
                 //为了符合基址寄存器折叠我们必须重新给KV算起始
                 int KV_global_idx=k_chunk_start*num_heads+head_idx;
