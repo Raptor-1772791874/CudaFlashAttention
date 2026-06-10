@@ -57,10 +57,10 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
             int right = num_batches - 1; 
             int batch_idx = 0;
 
-            int batch_idx =0;
+        
             /*  用2分查找节省时间
             假设前缀和数组是[0,100,350],如果我的起点是150我会找到batch1*/
-            while(cu_seqlens_blocks[batch_idx+1]<=q_chunk_idx){
+            while(left<=right){
                 // 右移位运算替代除法指令，直接在 ALU 层面完成降维
                 int mid = left + ((right - left) >> 1); 
                 
@@ -75,11 +75,10 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
             int seq_start =cu_seqlens[batch_idx];//起点为100
             int seq_end =cu_seqlens[batch_idx+1];//终点为350
 
-            //计算我是这个用户的第几个block？（以用户的block个数为背景）
+            //计算我是=在这个用户的第几个block里？（以用户的block个数为背景）
             int relative_chunk_idx=q_chunk_idx-cu_seqlens_blocks[batch_idx];
 
-            //用第几个block乘以大小后这里才是线程负责的token所在的全规格矩阵里第一个token全局起点（此背景是全局偏移且是4096开头）
-            //接上，意思是它没有走到自己负责的头的真实地址上只走到了自己所在的block离用户起点的偏移，还要继续算偏移。
+            //从用户token的起点跳过前面无关的block（每个block有128个线程）和他们负责的token，来到了线程负责的token的数值上，也就是说算线程负责用户的哪个token
             int global_q_start=seq_start+(relative_chunk_idx*Block_Size);//在Q的Block级全局偏移背景下。算当前线程负责哪个block里的token
             
             //先划定一个sharedMemory大小是多大，128个token128个维度
@@ -92,19 +91,13 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
          half* s_K_ptr = smem + 16384;                 // K 从 16384 开始
          half* s_V_ptr = smem + (16384 * 2);           // V 从 32768 开始
             
-
-            //并未在sharedmemory里，这是每个线程自己寄存器里的
-            float m_old=-INFINITY; //历史最大王
-            float l_old=0.0f;      //历史指数和（目前为0）
-            
-            //用来装最终的累加器O_local，这个线程负责当前词的128个维度所以开了一个一维数组存
-            float o_local[Head_Dim]={0.0f};
+           
 
             //一个float4任务可以搬16个字节即8个half数据所以除8
             const int f4_stride=Head_Dim/8;
 
             //直接降落到当前线程负责的token的block里第0个token的开头，具体见笔记
-            int Not_sure_index=global_q_start *num_heads+head_idx;//（此背景是Q的全局偏移而非显存全局偏移）
+            int Not_sure_index=global_q_start *num_heads+head_idx;//（此背景是Q里的偏移而非显存全局偏移，计算在token的哪个头上）
 
             const float4* Q_f4 = reinterpret_cast<const float4*>(Q + Not_sure_index * Head_Dim);
             float4* s_Q_f4 = reinterpret_cast<float4*>(s_Q_ptr);
@@ -118,7 +111,7 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
 
             #pragma unroll
             for(int i=0;i<16;++i){
-                //1个token有16个float4要搬一共128token则有2048个任务，一次搬运了128个float4所以16次循环就搬完了，tid是每个线程在当前搬运里的相对偏移
+                //1个token有16个float4要搬一共128token则有2048个任务，一次搬运了128个float4（每人搬1个）所以16次循环就搬完了，tid是每个线程在当前搬运里的相对偏移
                 int index=i*128+tid;//每个线程单独再编号，一次i循环会搬完128个float4，用这个保持偏移的精准
                 //index表示当前线程负责的具体哪个float4任务
 
@@ -131,10 +124,10 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                 if(current_global_token < seq_end) {
                     
                     // 【核心架构密码：跨越 num_heads 的维度撕裂】
-                    // 下一个词的同一个头，物理上隔了整整 num_heads 个头
+                    // 由于布局为标准交织，下一个词的同一个头，物理上隔了整整 num_heads 个头
                     int global_read_idx = token_offset * (num_heads * f4_stride) + Dim_offset;
                     
-                    // 执行搬运：全局显存 (跳跃读) -> SRAM (绝对连续写)
+                    // 执行搬运：全局显存 (跳跃读) -> Smem (绝对连续写)
                     s_Q_f4[index] = Q_f4[global_read_idx];
                     
                 } else {
@@ -146,10 +139,13 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
             } 
             // for 循环结束
 
-            // 绝对同步屏障：Q 矩阵已经分块全部躺在 SRAM 里了，必须等 128 个人全部搬完！
+            // 绝对同步屏障：Q 矩阵已经分块全部躺在 Smem 里了，必须等 128 个人全部搬完！
             __syncthreads();
 
-            //O必须在kchunk之外存在
+
+            float m_prev = -INFINITY;//先定义出历史的最大行值
+            float l_prev = 0.0f;//定义出历史的行和
+            //O必须在kv循环开始之前就一直存在，存储于寄存器中
                 
             wmma::fragment<wmma::accumulator,16,16,16,float> frag_O[4][4];
 
@@ -161,255 +157,322 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
                 }
                }
 
+
+
                //kv循环无需显式写循环两次，因为这里由start到end就是256个token而一次循环会搬运128个token完成一次直接跳过128个token。
             for(int k_chunk_start=seq_start;k_chunk_start<seq_end;k_chunk_start+=Block_Size){
                 
                 //重新寻找KV的开头的地址，globalqstart是大循环外面求的而且有Q的血如果用它每一次小循环转动都会重新计算巨大的地址偏移
                 //为了符合基址寄存器折叠我们必须重新给KV算起始
-                int KV_global_idx=k_chunk_start*num_heads+head_idx;
-                const float4* K_f4=reinterpret_cast<const float4*>(K+KV_global_idx*Head_Dim);
-                const float4* V_f4=reinterpret_cast<const float4*>(V+KV_global_idx*Head_Dim);
+                int KV_global_idx=k_chunk_start*num_heads+head_idx;//计算当前线程在负责的token的哪个头里所以得加上这个头的数字为偏移（在显存排布里，token0的num_heads(一般是32个）个头是排在一起的然后才是token1的32个头所以我们要算它到底在哪个头上）
+                const float4* K_f4=reinterpret_cast<const float4*>(K+KV_global_idx*Head_Dim);//乘以维度就是真实的内存地址了
 
-                //重复一下在搬运Q已经实践过的逻辑，把KV也搬走
-                #pragma  unroll
-                for(int i=0;i<16;++i){
-                    int  index =i*128+tid;//算自己搬运2048个floa4任务里的哪一个（背景是4096偏移），一个token有16个float4任务
-                    int token_offset=index/16;//算自己负责哪个token
-                    int Dim_offset=index%16;//算自己负责token里的哪个float4任务
-
-
-                    //查询当前token在数值上是否合法（在用户范围内）
-                    int current_K_token =k_chunk_start+token_offset;
-                    //合法词直接搬运即可，这里我们让KV直接一起搬运了因为偏移计算的逻辑是一致的直接用即可
-                    //一起搬还能掩盖内存延迟，减少了一半的V偏移的乘法计算开销
-                    if(current_K_token<seq_end){
-                        //计算公式见补充5，与Q一致不再此过多赘述
-                        int global_read_idx=token_offset*(num_heads*f4_stride)+Dim_offset;
-                        s_K_f4[index]=K_f4[global_read_idx];
-                        s_V_f4[index]=V_f4[global_read_idx];
-
-                    }//如果越界还是填0，不允许不填（破坏了矩阵完整性宁愿计算无效值也要保证矩阵乘法时满足法则）
-                    else{
-                        s_K_f4[index]=make_float4(0.0f ,0.0f ,0.0f ,0.0f);
-                        s_V_f4[index]=make_float4(0.0f ,0.0f ,0.0f ,0.0f);
-
-                    }
-                }
-                //必须统一停下等待全部的sharedmemory被填满拒绝脏读
-                __syncthreads();
-
-                
-
-
-                //正经算S矩阵了这下......
-
-                //先声明FragS在线程寄存器里
-                wmma::fragment<wmma::accumulator,16,16,16,float>frag_S[4][4];
-
-                //将存放结果的结构体数组都先初始化为0
+                //新架构中只搬运K，把V的内存留出来不急着搬运V等着后面给S的存在复用
                 #pragma unroll
-                for(int i=0;i<4;++i){
-                    #pragma unroll
-                    for(int j=0;j<4;j++){
-                        wmma::fill_fragment(frag_S[i][j],0.0f);
-                    }
-                }
+         for(int i=0; i<16; ++i){
+            int index = i*128 + tid;
+            int token_offset = index/16;
+            int Dim_offset = index%16;
+            if(k_chunk_start + token_offset < seq_end){
+                int global_read_idx = token_offset * (num_heads * f4_stride) + Dim_offset;
+                s_K_f4[index] = K_f4[global_read_idx]; 
+            }   
+            else {
+                s_K_f4[index] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+              }
+          }
+         __syncthreads(); // K 阵地准备完毕
 
-                /*为QK各声明4个格子，总大小为64与16（选64是要算64*64每个warp，选16是为了迎合tensor core）
-                为什么QK各要4个还是因为tensor core，每个大小为16*16（64/16为4）
-                类型为half半精度还是为了迎合tensor core*/
+    
+    // 2计算S，为Q*K转置
+    
+    {   //严格控制寄存器生命周期】
+        wmma::fragment<wmma::accumulator,16,16,16,float> frag_S[4][4];
+        #pragma unroll
+        for(int i=0; i<4; ++i){
+            #pragma unroll
+            for(int j=0; j<4; ++j) wmma::fill_fragment(frag_S[i][j], 0.0f);
+        }
 
-
-                wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> frag_Q[4];
-                wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> frag_K[4];/*虽然K矩阵是行主序存在内存里但是sgemm时用的是转置的（为了满足matrix mutiply的规则
-                                                                                       这里0开销仅通过申明列主序类型就完成了假装转置（Tensor Core还是会顺着读但当成一列）*/
-
-                /*时间线推进放在最外面，是因为fragS层面其他格子可以有数据的复用虽然单个fragS格子用不着
-                为啥是8次因为一次只能算16个token的16个维度*具体见补_充_2*/
-                #pragma unroll
-                for(int t_step=0;t_step<8;++t_step){
-
-                   //固定好SRAM大小，为128，也可以直接复用一个头的大小已在宏定义写好改为Head_Dim即可
-                    const int Stride_Sram=128;
-
-                    #pragma unroll
-                    for(int i=0;i<4;++i){
-                        wmma::load_matrix_sync(frag_Q[i],s_Q_ptr+(action_Q_offset+i*16)*Stride_Sram+t_step*16,Stride_Sram);//偏移公式看白皮书的版本1一页
-                    }
-
-                    #pragma unroll
-                    for(int j=0;j<4;++j){
-                        wmma::load_matrix_sync(frag_K[j],s_K_ptr+(action_K_offset+j*16)*Stride_Sram+t_step*16,Stride_Sram);
-                    }
-
-                    #pragma unroll
-                    for(int i=0;i<4;++i){
-                        #pragma unroll
-                        for(int j=0;j<4;++j){
-                            wmma::mma_sync(frag_S[i][j],frag_Q[i],frag_K[j],frag_S[i][j]);
-                        }
-                    }
-
-                }
-
-
-                //V1架构：采用分2批次处理FragS的规约。即Warp01先搬进SK的Smem地址里来
-
-                //先将原本的halfsKptr强转为float型巧妙偷天换日地复用
-                float* s_S_reduce=reinterpret_cast<float*>(s_K_ptr);
-
-                //时间线推进2次，由于规约的时候需要全部的维度在场所以我们选择让同一行的一起规约
-
-                const float scale_factor =1.0f/sqrtf(128.0f);
-
-
-                //提前声明出PV矩阵
-                wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>frag_P[4];
-               wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major>frag_V[4];
-                
-                #pragma unroll
-                for(int phase=0;phase<2;++phase){
-
-                    //检查轮到哪个Warp上场
-                    //action_row==0 表示Warp01上场   ,action_row==1  表示Warp23上场
-
-                    bool is_my_time = (action_row == phase);
-
-                    
-                    if(is_my_time){
-                        #pragma unroll
-                        for(int i=0; i<4; ++i){
-                            #pragma unroll
-                            for(int j=0; j<4; ++j){
-                                int local_row = i * 16;
-                                int local_col = action_col * 64 + j * 16;//actioncol可以代替专门给从64-127列的线程写一个+64偏移的语句
-                                float* target_ptr=s_S_reduce+local_row*128+local_col;//算真实的地址起始（从SKptr开始）
-                                wmma::store_matrix_sync(target_ptr, frag_S[i][j], 128, wmma::mem_row_major);
-                            }
-                        }
-                    }
-                    __syncthreads(); //先一步做完的给我停着等其他人全部落齐了才行也就是凑满64，128后才走
-
-                    // 三次标准Softmax 与 寄存器防线
-
-                    //由于分上下半场且我们是让同一actionrow的wrap工作的（即同64行），所以让一个线程负责1行128个s打分数据
-                    if(is_my_time){
-                        // 注意：这里退化回 0~63，两拨人交替使用 SRAM 的前 16KB！
-                        int local_row_idx = tid - (phase * 64); //用is my time2元对立巧妙的让不在场的warp不工作，但上下半场都用的同一SK地址
-                        float* my_row = s_S_reduce + local_row_idx * 128;  //定位到每个线程负责的行的开始，从SK首地址开始算偏移
-                        float row_max = -INFINITY;
-
-                        for(int a=0; a<128; ++a){
-                            my_row[a] *= scale_factor; //清洗数据做梯度消失的防爆处理，避免数值分布极度分散方差过大
-                            row_max = fmaxf(row_max, my_row[a]); //找每行最大
-                        }
-
-                        float row_sum = 0.0f;
-                        for(int a=0; a<128; ++a){
-                            /*即使有了梯度防爆，但极深的神经网络中还是有可能面临大数据
-                            假设S为1000，在scale（约为11.3）后约为100，如果不减去最大会直接变为e的100次方，撑爆数据类型的上限*/
-                            float exp_val = expf(my_row[a] - row_max);//soft Max中的数据保底防爆
-                            my_row[a] = exp_val;//把原S更换为上面做了防爆处理的数值。
-                            row_sum += exp_val;//出来把每行的数值加一起，一共循环128次
-                        }
-
-                        //在baseline original中我们下面是直接把数据写回去SK内存去了，但这会造成数据踩踏内存竞争污染
-                        // 寄存器墙：防止同 Warp 内线程前后踩踏，但此时寄存器早已溢出。
-                        half p_temp[128];
-                        #pragma unroll 4
-                        for(int a=0; a<128; ++a){
-                            p_temp[a] = __float2half(my_row[a] / row_sum);
-                        }
-
-                        // 直接写回SK PTR的32kb内存去
-                        #pragma unroll 4
-                        for(int a=0; a<128; ++a){
-                            s_K_ptr[local_row_idx * 128 + a] = p_temp[a];
-                        }
-                    }
-                    __syncthreads(); // 屏障2：等P矩阵安全写完
-
-                    // 趁热打铁直接执行 P*V 在Tensor Core里
-
-                    //与算S时采用的同一种套路让1鱼4吃寄存器级复用，用t_step充当时间线循环8次累加答案，利用外积重叠解决P*V的维度不满128的问题
-                    if(is_my_time){
-                        #pragma unroll
-                        for(int t_step=0; t_step<8; ++t_step){
-                            #pragma unroll
-                            for(int i=0; i<4; ++i){
-                                //此时 P 永远躺在 s_K_ptr 的最开头！
-                                wmma::load_matrix_sync(frag_P[i], s_K_ptr + (i * 16) * 128 + t_step * 16, 128);
-                            }
-                            
-                            #pragma unroll
-                            for(int j=0; j<4; ++j){
-                                // V 的读取是128行64列，P是64行128列
-                                //warp0负责的是0-64列的V，warp1负责的是64-127列的V
-                                wmma::load_matrix_sync(frag_V[j], s_V_ptr + (t_step * 16 * 128)+(action_col * 64 + j * 16) , 128);
-                            }
-                            
-                            #pragma unroll
-                            for(int i=0; i<4; ++i){
-                                #pragma unroll
-                                for(int j=0; j<4; ++j){
-                                    wmma::mma_sync(frag_O[i][j], frag_P[i], frag_V[j], frag_O[i][j]);
-                                }
-                            }
-                        }
-                    }
-                    __syncthreads(); // 屏障3：等半场的P*V算完，再进入下一轮，防止下个Phase的FP32进来覆盖掉上半场算的P
-
-                    
-        }//phase循环边界
-
-
-        //写回显存，卸磨杀驴，在单个block的情况下可以复用Q了，回到第64行写的smem[]那里引用
-
-        //不直接写回显存是因为不知道wmma底层如何进行lane映射的，无法达到访存合并。
-        float* s_O_dump=reinterpret_cast<float*>(smem);
+        wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> frag_Q[4];
+        wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major> frag_K[4];/*虽然K矩阵是行主序存在内存里但是sgemm时用的是转置的（为了满足matrix mutiply的规则
+                                                                                这里0开销仅通过申明列主序类型就完成了假装转置（Tensor Core还是会顺着读但当成一列）*/
 
         #pragma unroll
-        for(int i=0;i<4;++i){
+        for(int t_step=0; t_step<8; ++t_step){
             #pragma unroll
-            for(int j=0;j<4;++j){
-                /*与搬运S时的逻辑一模一样，直接复用actionnrow，col即可
-                warp0同样负责O的前64行和64列，且它的rowcol都是0也一样表示从0开始搬，其他warp同理*/
-                int local_row=action_row*64+i*16;
-                int local_col=action_col*64+j*16;
-                wmma::store_matrix_sync(s_O_dump+local_row*128+local_col,frag_O[i][j],128,wmma::mem_row_major);
+            for(int i=0; i<4; ++i) wmma::load_matrix_sync(frag_Q[i], s_Q_ptr + (action_Q_offset + i*16)*128 + t_step*16, 128);
+            #pragma unroll
+            for(int j=0; j<4; ++j) wmma::load_matrix_sync(frag_K[j], s_K_ptr + (action_K_offset + j*16)*128 + t_step*16, 128);
+            #pragma unroll
+            for(int i=0; i<4; ++i){
+                #pragma unroll
+                for(int j=0; j<4; ++j) wmma::mma_sync(frag_S[i][j], frag_Q[i], frag_K[j], frag_S[i][j]);
             }
         }
-        //这里搬回去时也完美32way bank conflict了
 
-        __syncthreads();
-        //老规矩集合，等4个warp所有人都搬完了才开始下一步。
+        //K的生命周期结束了，后面的计算与他无关，现在征用SK和SV打通64KB，作为S的存放地
+        float* s_S_full_buffer = reinterpret_cast<float*>(s_K_ptr); 
+        #pragma unroll
+        for(int i=0; i<4; ++i){
+            #pragma unroll
+            for(int j=0; j<4; ++j){
+                int local_row = action_row * 64 + i * 16;
+                int local_col = action_col * 64 + j * 16;
+                //将S全量存储在SK起的Smem里
+                wmma::store_matrix_sync(s_S_full_buffer + local_row * 128 + local_col, frag_S[i][j], 128, wmma::mem_row_major);
+            }
+        }
+    }   //计算S生命周期结束
+        __syncthreads(); //64KB的S矩阵全部出生保存在Smem里
 
+    
+    // 3做OnlineSoftmax
+    //重新指向SK是因为上一个是在括号里的，出了括号就无作用域了
+    
+    float* s_S_full_buffer = reinterpret_cast<float*>(s_K_ptr); 
+    float* my_row = s_S_full_buffer + tid * 128; // 每人处理一行
+    const float scale_factor = 1.0f / sqrtf(128.0f);//清洗数据做梯度消失的防爆处理，避免数值分布极度分散方差过大
 
-        if(tid<128){
-            //计算当前线程是否超出用户的有效token数
-            //globalqstart表示当前线程在用户中所属block的起点加tid就是算在这个block里负责用户的哪个token
-            //详情看写2
-            int current_global_token=global_q_start+tid;
+    //找局部最大值
+    float m_local = -INFINITY;
+    #pragma unroll 4
+    for(int a=0; a<128; ++a){
+        my_row[a]*=scale_factor;
+        m_local = fmaxf(m_local, my_row[a]);}
 
-            if(current_global_token<seq_end){
-                int global_O_idx =current_global_token *(num_heads*Head_Dim)+(head_idx*Head_Dim);
-                //要偏移其他token的步长（32个头每个128维度）和自己token里的其他头
-                half* O_target =O+global_O_idx;//算显存的偏移
-                float* O_source =s_O_dump+tid*128;//算在Smem里的偏移
+    //Online核心,找到过去和现在谁是新王，产生动态补偿
+    float m_now = fmaxf(m_prev, m_local);
+    float row_scale = expf(m_prev - m_now);//算出补偿指数
+    
 
-                
+    //补偿历史的行总和，再计算当前指数与新总和
+    l_prev *= row_scale;
+
+    //存放本次的行和
+    float row_sum = 0.0f;
+    #pragma unroll 4
+    for(int a=0; a<128; ++a){
+        /*即使有了梯度防爆，但极深的神经网络中还是有可能面临大数据
+        假设S为1000，在scale（约为11.3）后约为100，如果不减去最大会直接变为e的100次方，撑爆数据类型的上限*/
+        float exp_val = expf(my_row[a] - m_now);//softMax中的数据保底防爆
+        my_row[a] = exp_val;//刷新下防爆后的每个数字。这里省去中间变量expval后在某些无优化的情况下会多一条读出Smem的指令和读取
+        row_sum += exp_val;//卷走行和
+    }
+
+    l_prev += row_sum; //累积新旧行和
+    m_prev = m_now;    //更新，到当前K的行最大值
+    
+    //在baseline original中我们下面是直接把数据写回去SK内存去了，但这会造成数据踩踏内存竞争污染
+    //算出P先按半精度存在自己的寄存器里开销64个float型，根写回SK这步分开避免在一起执行时造成内存竞争复写
+    half p_temp[128];
+    #pragma unroll 4  //减少L1cache存指令开销，底层只会有4个寄存器开销存储SaSS指令
+    for(int a=0; a<128; ++a){
+        //OnlinesoftMax中不在写回的时候归一化概率（这会将无意义的token的概率拔高到有意义的token的地步上导致整体的相对权重被打乱，所以Online里的每个K块的e指数总和只为了一只累加得到最后整体的总和）
+        //只转化为半精度，此时P的大小只有32KB减少了Smem的占用
+        p_temp[a] = __float2half(my_row[a]); 
+    }
+    
+    //保证所有线程彻底读完了64KB的S矩阵
+    __syncthreads(); 
+
+    //将强转half型的S全部写回SK的32KB内存中 
+    #pragma unroll 4
+    for(int a=0; a<128; ++a){
+        s_K_ptr[tid * 128 + a] = p_temp[a]; 
+    }
+    __syncthreads(); 
+
+  
+    //4闲置的V的Smem地址(32KB)在此处登场，用来存储然后缩放历史O矩阵，而由于O矩阵此时未归一化且是单精度
+    //所以被迫重新引入了之前的phase分上下半场放入O矩阵
+   
+    float* s_O_buffer = reinterpret_cast<float*>(s_V_ptr); 
+
+    #pragma unroll
+    //上下半场循环开始
+    for(int phase=0; phase<2; ++phase){
+
+        //检查轮到哪个Warp上场
+        //action_row==0 表示Warp01上场   ,action_row==1  表示Warp23上场
+        bool is_my_time = (action_row == phase);
+        
+        // 吐出历史的O
+        //每人负责64*64的历史O，一个fragment是16*16所以一共16次搬进去。
+        if(is_my_time){
+            #pragma unroll
+            for(int i=0; i<4; ++i){
                 #pragma unroll
-                for(int col=0;col<128;++col){
-                    //将Smem里的数拿出强转为半精度放回显存
-                    //这里完美32wayBankconflict和访存不合并了因为一个线程负责一个token的128维度的搬运，则32个线程跨步非常大
-                    O_target[col]=__float2half(O_source[col]);
+                for(int j=0; j<4; ++j){
+                    int local_row = i * 16; //无论是上半场还是下半场，他们都在一样的内存里倒腾所以不需要加上64行偏移（即下半场也是占满上半场同样位置的64行128列）
+                    int local_col = action_col * 64 + j * 16;  //actioncol可以代替专门给从64-127列的线程写一个+64偏移的语句
+                    wmma::store_matrix_sync(s_O_buffer + local_row * 128 + local_col, frag_O[i][j], 128, wmma::mem_row_major);
                 }
             }
         }
-              
-                __syncthreads();
-}//k循环边界
+        __syncthreads();
 
+        //缩放
+        if(is_my_time){
+            //由于分上下半场且我们是让同一actionrow的wrap工作的（即同64行但不同列），所以让一个线程负责1行128个s打分数据
+            //当前K块得到的每行缩放指数在求行最大时已经得到且存储在寄存器里 
+
+            //定位到每个线程负责的行的开始，从SV首地址开始算偏移
+            float* my_O_row = s_O_buffer + (tid - phase * 64) * 128;//当下半场执行时这里会减去64，是因为下半场也是复用的上半场那64行根本没有什么128行所以扣掉（区分逻辑工号tid和真实行数）
+                                                             //用is my time2元对立巧妙的让不在场的warp不工作，但上下半场都用的同一SK地址
+            #pragma unroll 4
+            for(int c=0; c<128; ++c){
+                my_O_row[c]*=row_scale;//补偿历史O矩阵的每行里128个数字
+            }
+        }
+        __syncthreads();//务必等每个数都补偿完
+
+        //写回
+        if(is_my_time){
+            #pragma unroll
+            for(int i=0; i<4; ++i){
+                #pragma unroll
+                for(int j=0; j<4; ++j){
+                    int local_row = i * 16;
+                    int local_col = action_col * 64 + j * 16;
+                    wmma::load_matrix_sync(frag_O[i][j], s_O_buffer + local_row * 128 + local_col, 128, wmma::mem_row_major);
+                }
+            }
+        }
+        __syncthreads(); 
+    } //上下半场循环结束
+     //历史的O在上下半场下缩放完成。s_V_ptr再次闲置了现在可以搬V算PV了
+
+     
+
+    //5搬运真实的V矩阵进场
+    //直接照搬搬运K的逻辑和数值即可
+    const float4* V_f4 = reinterpret_cast<const float4*>(V + KV_global_idx * Head_Dim);
+    #pragma unroll
+    for(int i=0; i<16; ++i){
+
+        int index = i*128 + tid;//算自己搬运2048个floa4任务里的哪一个（背景是4096偏移），一个token有16个float4任务
+        int token_offset = index/16;//算自己负责哪个token
+        int Dim_offset = index%16;//算自己负责token里的哪个float4任务
+
+
+        //查询当前token在数值上是否合法（在用户范围内）
+        if(k_chunk_start + token_offset < seq_end){
+            //合法词直接搬运即可，这里我们让KV直接一起搬运了因为偏移计算的逻辑是一致的直接用即可
+
+            //计算公式见补充5，与Q一致不再此过多赘述
+            int global_read_idx = token_offset * (num_heads * f4_stride) + Dim_offset;
+            s_V_f4[index] = V_f4[global_read_idx]; 
+        } else {
+            //如果越界还是填0，不允许不填（破坏了矩阵完整性宁愿计算无效值也要保证矩阵乘法时满足法则）
+            s_V_f4[index] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);//空的还是先置0
+        }
+    }
+    __syncthreads();  //确保V完整的存在于SV内存里了
+
+    
+      //6计算本次的P*V，其结果直接累加进frag_O（无论多少次算PV，由于硬件底层排列不变所以结果完全可以直接叠加原来的O）
+    
+    {   //花括号限制生命周期强行压短
+        wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major> frag_P[4];
+        wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major> frag_V[4];
+
+        #pragma unroll
+        for(int t_step=0; t_step<8; ++t_step){  //与算S时采用的同一种套路让1鱼4吃寄存器级复用，用t_step充当时间线循环8次累加答案，利用外积重叠解决P*V的维度不满128的问题
+            #pragma unroll
+            //此时 P 永远躺在 s_K_ptr 的最开头！
+            for(int i=0; i<4; ++i) wmma::load_matrix_sync(frag_P[i], s_K_ptr + (action_row * 64 + i * 16) * 128 + t_step * 16, 128);
+            #pragma unroll
+            // V 的读取是128行64列，P是64行128列
+            //warp0负责的是0-64列的V，warp1负责的是64-127列的V
+            for(int j=0; j<4; ++j) wmma::load_matrix_sync(frag_V[j], s_V_ptr + (t_step * 16 * 128) + (action_col * 64 + j * 16), 128);
+            #pragma unroll
+            for(int i=0; i<4; ++i){
+                #pragma unroll
+                for(int j=0; j<4; ++j) wmma::mma_sync(frag_O[i][j], frag_P[i], frag_V[j], frag_O[i][j]);
+                //这里是把新算出的O直接累加进历史的O矩阵里也就是线程自己的fragment里的没有挪去其他地方存储
+            } 
+
+        } //PV计算结束
+        
+    }//括号结束严格限制其生命周期不允许多占用寄存器
+        
+    __syncthreads();  //清理战场，进入下一个KChunk循环
+
+} //kv循环结束
+            
+
+ 
+//终极归一化与卸磨杀驴
+//利用 s_O_dump (复用最初的 Q 阵地，Q的生命周期只存在于算S，等待KV循环完之后QKVSP都没用了可以复用内存做最终的归一化了)
+
+float* s_O_dump = reinterpret_cast<float*>(smem); 
+
+
+//霸占紧挨着的512Bytes作为l_prev的共享公告板。每个线程捏着一个本行的经过历史累加的行总和
+//O矩阵是128*128总共16384个float，正好是64KB
+float* s_l_prev_dump=s_O_dump+16384; //从完整的O在Smem里空间的末尾插根标，从标后512byte存储每行最终的历史行和（经过历史补偿累加）
+
+//解除寄存器死锁
+//128个线程同时交出自己物理寄存器里的l_prev，钉在公告板上，因为要执行翻转轴心了
+s_l_prev_dump[tid] = l_prev;
+
+
+#pragma unroll
+for(int i=0; i<4; ++i){
+    #pragma unroll
+    for(int j=0; j<4; ++j){
+        //把FragO降临在从SQ开始的Smem里，这是最后一次出现在Smem中
+        int local_row = action_row * 64 + i * 16;//因为是一次性全部倾倒在Smem里所以行也必须加上偏移因为FragO是128行与128列的
+        int local_col = action_col * 64 + j * 16;
+        wmma::store_matrix_sync(s_O_dump + local_row * 128 + local_col, frag_O[i][j], 128, wmma::mem_row_major);
+    }
+}
+__syncthreads();
+
+
+//核心馈赠，不再让一个线程负责一行的数据的归一化与写回显存的搬运
+//我们让一个线程负责一列也叫翻转轴心在Smem里bankconflict的惩罚比写回显存时访存不合并小
+// 外层循环去遍历128个行 (row = 0~127)
+
+#pragma unroll 4
+for (int row = 0; row < 128; ++row) {//表示目前来到哪一行
+    // 计算当前行对应的用户里的Token的数值，即当前来到了哪一个token的行里
+    int current_global_token = global_q_start+row;
+    
+    //不准越界读其他用户的token，越界即斩杀
+    if (current_global_token < seq_end) {
+        
+        // 算当前头里的Token在显存里的真实偏移
+        int global_O_base = current_global_token * (num_heads*Head_Dim)+(head_idx*Head_Dim);//交织布局下一个token要把自己的头全排列后才轮到下一个token的头
+        
+        // 核心提取
+        //现在，tid不再表示一个线程负责一行了，现在表示一个线程负责一列，128个线程完整的负责了一行里的全部列
+        // 1：根据 tid (列) 和 row (行) 从 Smem 中提取分子
+        float numerator = s_O_dump[row * 128 + tid];//即算出每个线程负责本行的哪一列，行号乘128是算偏移，即行与行之间步长为128个数
+
+        //知道了当前线程在哪一行和哪一行的数值还不够，还得知道当前行的历史行总和是多少
+        //如果没有前面的写入Smem里共享的话，线程0存行0的行总和但当这个翻转轴心来到行0外时除了当时负责本行的线程根本没人知道这行的行和是多少而且也不能用因为是存在寄存器里的没法直接读也要经过Smem
+      
+        // 2：从公告板中提取这一行专属的分母
+        float denominator = s_l_prev_dump[row];
+        
+
+        //终极归一化与降维：
+        //本行的每一个数都除以本行的历史行和做归一化并且最终转变为半精度half型
+        half final_val = __float2half(numerator / denominator);
+        
+
+        //翻转轴心的奖励是完美的访存合并
+        //注意看指针偏移，同一个 Warp里的32个线程，此时row是一样的
+        //就表示它们的偏移全是global_O_base+tid。
+        //这意味着这32个线程在写回显存时，地址是绝对连续的 0,1,2...31，是完美的访存合并而原先按照每个线程负责一行时，32个线程是巨大的步长用cpu的话说就是极差的局部性
+        //GPU里的内存控制器会直接将它们打包成一次完美的32byteBurst写入操作
+        O[global_O_base + tid] = final_val;
+        }//将循环的每行O矩阵里的数据写回到显存去
+   
+    }//完整循环128次即完整写完128行
+                
 }//核函数边界
 
 
@@ -452,28 +515,28 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
         flash_atten_kernel<<<grid,block,smem_size,stream>>>(Q,K,V,O,s_dump,cu_seqlens,cu_seqlen_blocks,total_tokens,num_heads,num_batches);
           
         //全部停下来等待
-       cudaDeviceSynchronize();
+       //cudaDeviceSynchronize();
 
        
     }
    
 
-// 包装器，暴露给 Python
-    torch::Tensor forward_debug(
+torch::Tensor forward_debug(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V, 
-    torch::Tensor cu_seqlens, torch::Tensor cu_seqlen_blocks) 
+    torch::Tensor cu_seqlens, torch::Tensor cu_seqlen_blocks,int total_blocks) 
 {
     int total_tokens = Q.size(0);
     int num_heads = Q.size(1);
-    int num_batches = cu_seqlens.size(0) - 1;//前缀和数组
-    
-    // 初始化 O 矩阵 (目前用不到，但为了凑齐参数)
+    int num_batches = cu_seqlens.size(0) - 1; // 提取真实的用户批次数
+
+    // 初始化 O 矩阵 
     auto O = torch::empty_like(Q);
-    // 初始化 S_dump 靶场！大小为 [128, 128]，类型为 float32
+    
+    // 初始化 S_dump 靶场！
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
     auto S_dump = torch::zeros({128, 128}, options);
 
-    // 提取指针
+    // 提取底层物理指针
     half* q_ptr = reinterpret_cast<half*>(Q.data_ptr<at::Half>());
     half* k_ptr = reinterpret_cast<half*>(K.data_ptr<at::Half>());
     half* v_ptr = reinterpret_cast<half*>(V.data_ptr<at::Half>());
@@ -482,10 +545,16 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
     int* seqlens_ptr = cu_seqlens.data_ptr<int>();
     int* blocks_ptr = cu_seqlen_blocks.data_ptr<int>();
 
-    // Varlen 单 Block 极简测试：强行设定只测 1 个 Block
-    dim3 grid(1, 1, 1);
-    dim3 block(128); // Block_Size = 128
-    //定义掉128*128不要用纯数字避免后续暴雷
+    
+    //  从 blocks_ptr 的末尾直接提取全量网格所需的 Block 总数
+    //  在你的 256 Token 测试中，num_batches 为 1，blocks_ptr[1] 会精准吐出 2
+     
+
+    // 砸碎 (1, 1, 1) 的绑定，让网格随着Token数和Head数横向增加
+    dim3 grid(total_blocks, 1, num_heads); 
+    dim3 block(Block_Size); // 128
+
+    // 动态共享内存重分配 (3 * 128 * 128 * 2 Bytes = 96KB)
     int smem_size = 3 * TILE_ELEMS * sizeof(half);
     cudaFuncSetAttribute(
         flash_atten_kernel, 
@@ -493,18 +562,19 @@ constexpr int TILE_ELEMS = Block_Size*Head_Dim;
         smem_size
     );
 
-    // 启动核函数
-    flash_atten_kernel<<<grid, block,smem_size>>>(
+    // 启动完全体硬件网格
+    flash_atten_kernel<<<grid, block, smem_size>>>(
         q_ptr, k_ptr, v_ptr, o_ptr, s_dump_ptr,
-        seqlens_ptr, blocks_ptr, total_tokens, num_heads,num_batches
+        seqlens_ptr, blocks_ptr, total_tokens, num_heads, num_batches
     );
 
-    //测性能时把Device Sync给注释掉不要执行
-    cudaDeviceSynchronize();
+    // 测性能时把这里的CudaDeviceSync注释掉
+    // 因为Pythonbenchmark脚本里已经自带了更精准的torch.cuda.Event 异步事件同步
+    // cudaDeviceSynchronize(); 
+
     return O;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward", &forward_debug, "FlashAttention Varlen Debug Dump");
 }
-    
