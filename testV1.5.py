@@ -21,6 +21,8 @@ flash_module = load(
         "-U__CUDA_NO_HALF_OPERATORS__",
         "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-Xptxas=-v",
+        "-lineinfo",
     ],
     verbose=True,
 )
