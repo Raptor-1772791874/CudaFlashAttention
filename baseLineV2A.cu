@@ -1,4 +1,5 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <math_constants.h>
@@ -9,6 +10,11 @@ using namespace nvcuda;
 #define Block_Size 64
 #define Head_Dim 128
 
+//控制申请的动态内存大小（由token数和头维度在Launch函数里决定）
+constexpr int TILE_ELEMS = Block_Size*Head_Dim;
+
+
+
 __global__ void flash_atten_kernel(
     const half* __restrict__ Q,
     const half* __restrict__ K,
@@ -18,70 +24,125 @@ __global__ void flash_atten_kernel(
     half* __restrict__ O,
     int num_batches) 
 {
-    // 网格坐标系
-    int q_chunk_idx = blockIdx.x; 
-    int head_idx = blockIdx.z; 
-    int tid = threadIdx.x;
-
-    // 1D Warp 拓扑
-    int warp_id = tid / 32;
-    int lane_id = tid % 32;
-    int action_Q_offset = warp_id * 16; 
     
-    // 二分查找锁定用户归属
+     /*V2A里，将原先128个token128个维度拆分成64个token128个维度，所以导致原本一个128token的任务被拆分成两个
+        我们的选择是加倍Block数，让一个block负责一个任务里的一半（空间换时间，且这两个任务本身不互相依赖）*/
+
+    int q_chunk_idx = blockIdx.x;  //线程属于第几个block（不是每个用户，以全局block来算的）（一个block负责64个token）
+    int head_idx = blockIdx.z;     //负责哪个头（32之一）
+    int tid = threadIdx.x;        //我的工号是多少（负责64个token里的具体哪一个）
+
+    // 新架构下的 1D Warp拓扑
+    // 128个线程分4个Warp，QKV现在只有64行。
+    // 每个Warp负责16行的全部列，消除了前几个版本里的错位
+    int warp_id = tid / 32;  // 0, 1, 2, 3（算线程属于哪个Warp）
+    int lane_id = tid % 32;  // 0 ~ 31 （算线程在warp里的偏移）
+    int action_Q_offset = warp_id * 16;   // Q的行偏移，每个Warp负责16行
+    /* 彻底消灭掉原来分配不均匀一个warp不负责完整的列导致出现的action_col了 
+      无论哪个warp，它算S时都从K的开头读取*/
+
+
+
+
+        /*常规的写法是让一个线程负责一个token的128个维度，在交织排布上会造成严重的访存不合并
+        所以我们这里用轴心翻转，让一个线程负责一个维度（最后是一个线程负责一个float4）*/          
+
+        /* 由于N的长度是b个用户的token凑一起的。所以一个block里可能参杂了两个用户甚至多个
+        所以我们必须要查一个前缀和用户token的数组来找到当前线程到底负责哪个用户*/
+    
+   /* 用2分查找去求出每个人在total tokens里负责哪个token以及在totoal blocks里哪个block
+      假设前缀和数组是[0,100,350],如果我的起点是150我会找到batch1*/
     int left = 0, right = num_batches - 1, batch_idx = 0;
     while(left <= right){
+        // 右移位运算替代除法指令，直接在ALU层面最快速计算
         int mid = left + ((right - left) >> 1);
+
         if (cu_seqlens_blocks[mid] <= q_chunk_idx) {
-            batch_idx = mid;
-            left = mid + 1;
+            batch_idx = mid;   // 记录当前合法的最大批次索引
+            left = mid + 1;    // 继续向右侧显存域逼近
         } else {
-            right = mid - 1;
+            right = mid - 1;   // 收缩左侧显存域
         }
-    }
-    
-    int seq_start = cu_seqlens[batch_idx];
-    int seq_end = cu_seqlens[batch_idx+1];
+    } //二分查找结束
+
+    //找到当前用户的合法边界
+    int seq_start = cu_seqlens[batch_idx];//起点为100
+    int seq_end = cu_seqlens[batch_idx+1];//终点为350
+
+    //计算我在这个用户的第几个block里？（以用户的block个数为背景）
     int relative_chunk_idx = q_chunk_idx - cu_seqlens_blocks[batch_idx];
     
+    //从用户token的起点跳过前面无关的block（每个block有128个线程）和他们负责的token，来到了线程负责的token（128个数值上），也就是说算线程负责用户的哪个token      
     int global_q_start = seq_start + relative_chunk_idx * Block_Size;
-    if (global_q_start >= seq_end) return; 
+    //简而言之就是在token的数组里算我到底负责哪个block里的token（跳过其他block的token）
 
-    // 48KB 物理阵地划分
-    extern __shared__ half smem[];
-    half* s_Q_ptr = smem;                 // 0 ~ 16KB
-    half* s_K_ptr = smem + 8192;          // 16KB ~ 32KB
-    half* s_V_ptr = smem + 16384;         // 32KB ~ 48KB
+    if (global_q_start >= seq_end) return; //越界直接斩杀
 
-    int num_heads = gridDim.z; 
-    const int f4_stride = Head_Dim / 8; // 16
+    //先划定一个sharedMemory大小是多大，128个token128个维度
+    extern __shared__ half smem[]; //只调用声明但不定义，只为了过编译期，等Linker链接
+    half* s_Q_ptr = smem;                // Q 从 0 开始
+    half* s_K_ptr = smem + 8192;         // K 从 8192 开始
+    half* s_V_ptr = smem + 16384;        // V 从 16384 开始
+
+    int num_heads = gridDim.z; //避开传参开销，具体见Launch函数
+
+
+
+    //一个float4任务可以搬16个字节即8个half数据所以除8
+    const int f4_stride = Head_Dim / 8;
+
+
+
+     //准备搬运Q进s_Q。再for搬运K，然后点积算S        
+    /*128个线程按行来搬这样访存合并，且一个线程一次不搬一个half，而是一次搬运一个float4任务（一个float4是8个half），整个Q一共64行*16个任务，所以一次即可搬走8行
+    所以64*16/128，只需要让128个线程每人搬8次即可完成*/
+
 
     // 1. 搬运 Q 矩阵
-    int token_offset_q = global_q_start * num_heads + head_idx;
-    const float4* Q_f4 = reinterpret_cast<const float4*>(Q + token_offset_q * Head_Dim);
+    //直接降落到当前线程负责的token的block里第0个token的开头，具体见笔记
+    int token_offset_q = global_q_start * num_heads + head_idx;  //此背景是Q里的偏移而非显存全局偏移，计算在token的哪个头上）
+    const float4* Q_f4 = reinterpret_cast<const float4*>(Q + token_offset_q * Head_Dim);  //读取改为float4型
     float4* s_Q_f4 = reinterpret_cast<float4*>(s_Q_ptr);
     
-    const int q_stride_8_rows = 8 * (num_heads * f4_stride);
-    int q_row_base = tid / 16;
-    int q_col_f4 = tid % 16;
-    const float4* my_Q_ptr = Q_f4 + q_row_base * (num_heads * f4_stride) + q_col_f4;
-    float4* my_s_Q_ptr = s_Q_f4 + tid;
+    // 时间线推进，每次吞8行，在显存里的偏移是多少
+    const int q_stride_8_rows = 8 * (num_heads * f4_stride);  //8行。一个token有32个头和本行有16个float4任务
+
+    // 循环外就算出物理基址(8次循环吞噬64行)，不让在循环里一直重复计算循环不变量
+    int q_row_base = tid / 16;  // 0~7（计算线程负责的float4任务属于8个token行号里的哪一行）
+    int q_col_f4 = tid % 16;    // 0~15（计算线程负责本行16个float4任务的哪一个）
+
+    //算出线程负责的float4任务在Q_f4里的物理偏移 (循环外一次性算死这些循环不变量)
+    //跳过前面的行后，偏移个负责的float4大小
+    const float4* my_Q_ptr = Q_f4 + q_row_base * (num_heads * f4_stride) + q_col_f4; //最后加上Q的显存地址，就是在Base Q里的偏移
+    
+    // 再映射到SQ上
+    //SQ是我们自己开的不是显存里是交织排布，所以写的逻辑简单不绕
+    float4* my_s_Q_ptr = s_Q_f4 + tid;  //从SQPTR开始，一个线程负责放一个float4任务且都是float4指标，所以直接加线程编号即可（这里会有4Way BankConflict，32个Bank同一时钟周期只有128byte，所以会分4批吃下一个warp） 
+
 
     #pragma unroll
+     //循环8次搬完64行Q矩阵
     for(int i = 0; i < 8; ++i) {
+
+        //保证线程们搬运的token的任务是在当前用户里的合法token数的，每循环一次即表示搬完了8个token力保不能越界                     
         if (global_q_start + q_row_base + i * 8 < seq_end) {
+
+            //如果合法，就把Q地址里的东西解引用拿给SQ里去存储
             *my_s_Q_ptr = *my_Q_ptr;
         } else {
+            //越界不合法则直接置放0
             *my_s_Q_ptr = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
-        my_Q_ptr += q_stride_8_rows;
-        my_s_Q_ptr += 128;
+        my_Q_ptr += q_stride_8_rows;  //往前推进8行在Q里的真实偏移量
+        my_s_Q_ptr += 128;  //往前推进128个float4的偏移为下次循环准备
     }
-    __syncthreads();
+
+    __syncthreads();  //Q搬运结束
 
     // 寄存器核心：历史 O 初始化
-    float m_prev = -INFINITY;
-    float l_prev = 0.0f;
+    float m_prev = -INFINITY;  //先定义出历史的最大行值
+    float l_prev = 0.0f;       //定义出历史的行和
+    
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_O[8];
     #pragma unroll
     for(int j = 0; j < 8; ++j){
@@ -285,9 +346,11 @@ __global__ void flash_atten_kernel(
     float* s_O_dump = reinterpret_cast<float*>(smem); 
     float* s_l_prev_dump = s_O_dump + (64 * 128); 
 
+    
     if (tid < 64) {
         s_l_prev_dump[tid] = l_prev;
     }
+
 
     #pragma unroll
     for(int j = 0; j < 8; ++j){ 
@@ -296,6 +359,7 @@ __global__ void flash_atten_kernel(
         wmma::store_matrix_sync(s_O_dump + local_row * 128 + local_col, frag_O[j], 128, wmma::mem_row_major);
     }
     __syncthreads();
+
 
     // 轴心翻转
     #pragma unroll 4
@@ -310,35 +374,90 @@ __global__ void flash_atten_kernel(
             half final_val = __float2half(numerator / denominator);
             O[global_O_base + tid] = final_val; 
         }
-    }
+
+    }//将归一化后的O写回显存结束
+
+
+} //核函数结束
+
+
+
+
+void launch_flash_atten_forward(
+    const half* Q, const half* K, const half* V, half* O,
+    const int* cu_seqlens, 
+    const int* cu_seqlens_blocks,
+    int total_tokens, 
+    int total_blocks, 
+    int num_heads, 
+    int num_batches,
+    cudaStream_t stream) 
+{
+    // 强制征用 48KB 动态共享内存
+    int smem_size = 3 * TILE_ELEMS * sizeof(half); 
+    
+    // 【物理越权】：突破 48KB 硬件静态限制，向 GPU 申请支配权
+    cudaFuncSetAttribute(
+        flash_atten_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size
+    );
+
+    // 【网格降维映射】
+    int grid_x = total_blocks;
+    int grid_z = num_heads;
+    
+    // X轴跑块，Z轴跑头
+    dim3 grid(grid_x, 1, grid_z);
+    dim3 block(128); // 一维步兵连
+
+    // 【点火执行】：注意这里的 smem_size 和 stream 必须塞入第三、第四个配置位！
+    flash_atten_kernel<<<grid, block, smem_size, stream>>>(
+        Q, K, V, 
+        cu_seqlens, cu_seqlens_blocks, 
+        O, num_batches
+    );
 }
+
 
 // ============================================================================
 // PyTorch C++ 绑定桥梁
 // ============================================================================
+
+
+
 torch::Tensor forward(
     torch::Tensor Q, torch::Tensor K, torch::Tensor V,
     torch::Tensor cu_seqlens, torch::Tensor cu_seqlens_blocks,
     int total_blocks)
 {
+    //  定义O矩阵
     auto O = torch::empty_like(Q);
-    int num_batches = cu_seqlens.size(0) - 1;
+    int num_batches = cu_seqlens.size(0) - 1; //提取真实的用户批次数
     int num_heads = Q.size(1);
-    
-    dim3 grid(total_blocks, num_heads, 1);
-    dim3 block(128);
-    
-    int smem_size = 48 * 1024;
+    int total_tokens = Q.size(0); // 取出压扁后的token总长度
 
-    flash_atten_kernel<<<grid, block, smem_size>>>(
+    // 抓取PyTorch当前的计算流，防止CPU/GPU异步调度灾难
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // 让C++调度引擎去调用launch函数解耦三者
+    launch_flash_atten_forward(
         reinterpret_cast<const half*>(Q.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(K.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(V.data_ptr<at::Half>()),
+        reinterpret_cast<half*>(O.data_ptr<at::Half>()),
         cu_seqlens.data_ptr<int>(),
         cu_seqlens_blocks.data_ptr<int>(),
-        reinterpret_cast<half*>(O.data_ptr<at::Half>()),
-        num_batches
+        total_tokens,
+        total_blocks,
+        num_heads,
+        num_batches,
+        stream
     );
+
+    // 测性能时把这里的CudaDeviceSync注释掉
+    // 因为Pythonbenchmark脚本里已经自带了更精准的torch.cuda.Event 异步事件同步
+    // cudaDeviceSynchronize(); 
 
     return O;
 }
