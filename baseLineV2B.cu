@@ -145,8 +145,9 @@ __global__ void flash_atten_kernel(
 
 
     // 寄存器核心：历史 O 初始化
-    float m_prev = -INFINITY;  //先定义出历史的最大行值
-    float l_prev = 0.0f;       //定义出历史的行和
+   // V2B的前置物理重塑：一个线程同时看管两个张量，状态必须双线维系（0管上半场1管下半场
+    float m_prev[2] = {-INFINITY, -INFINITY};
+    float l_prev[2] = {0.0f, 0.0f};
     
     //O必须在kv循环开始之前就一直存在，且存储于寄存器中
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_O[8];  //初始化FragO时，由于每个warp分到16*128的O矩阵，所以只需要8个格子即可
@@ -194,7 +195,7 @@ __global__ void flash_atten_kernel(
 
 
         // 3. 计算 S = Q * K^T （S大小为64*64的float单精度）
-        {   //用花括号严格控制寄存器生命周期
+          //用花括号严格控制寄存器生命周期
             //每个warp分到16*64的S，所以只需要4个格子即可
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> frag_S[4];
             #pragma unroll
@@ -230,149 +231,149 @@ __global__ void flash_atten_kernel(
             __syncthreads();
 
 
-            //K的生命周期结束了，后面的计算与他无关，复用SK内存作为S的存放地
-            float* s_S_full_buffer = reinterpret_cast<float*>(s_K_ptr); 
+            
+        
+     const float scale_factor = 1.0f / sqrtf(128.0f);
+
+float local_max_0 = -INFINITY;
+float local_max_1 = -INFINITY;
+
+// ------------------------------------------------------------
+// WMMA accumulator fragment layout on A100/3090 observed:
+//
+// row_low  : x[0], x[1], x[4], x[5]
+// row_high : x[2], x[3], x[6], x[7]
+//
+// quad lanes:
+// lane 0..3   -> row 0 / row 8
+// lane 4..7   -> row 1 / row 9
+// ...
+// lane 28..31 -> row 7 / row 15
+// ------------------------------------------------------------
+
+// 1. scale + local max
+#pragma unroll
+for (int j = 0; j < 4; ++j) {
+    // scale all elements first
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        frag_S[j].x[i] *= scale_factor;
+    }
+
+    // row_low = x0, x1, x4, x5
+    local_max_0 = fmaxf(local_max_0, frag_S[j].x[0]);
+    local_max_0 = fmaxf(local_max_0, frag_S[j].x[1]);
+    local_max_0 = fmaxf(local_max_0, frag_S[j].x[4]);
+    local_max_0 = fmaxf(local_max_0, frag_S[j].x[5]);
+
+    // row_high = x2, x3, x6, x7
+    local_max_1 = fmaxf(local_max_1, frag_S[j].x[2]);
+    local_max_1 = fmaxf(local_max_1, frag_S[j].x[3]);
+    local_max_1 = fmaxf(local_max_1, frag_S[j].x[6]);
+    local_max_1 = fmaxf(local_max_1, frag_S[j].x[7]);
+}
+
+// 2. quad 内规约。lane 0..3 / 4..7 / ... 各自负责同一行。
+// xor 1 + xor 2 正好覆盖 4-lane group。
+local_max_0 = fmaxf(local_max_0, __shfl_xor_sync(0xffffffff, local_max_0, 1));
+local_max_0 = fmaxf(local_max_0, __shfl_xor_sync(0xffffffff, local_max_0, 2));
+
+local_max_1 = fmaxf(local_max_1, __shfl_xor_sync(0xffffffff, local_max_1, 1));
+local_max_1 = fmaxf(local_max_1, __shfl_xor_sync(0xffffffff, local_max_1, 2));
+
+// 3. online softmax state merge
+float m_now_0 = fmaxf(m_prev[0], local_max_0);
+float m_now_1 = fmaxf(m_prev[1], local_max_1);
+
+float row_scale_0 = expf(m_prev[0] - m_now_0);
+float row_scale_1 = expf(m_prev[1] - m_now_1);
+
+l_prev[0] *= row_scale_0;
+l_prev[1] *= row_scale_1;
+
+// 4. O history scale in registers
+#pragma unroll
+for (int j = 0; j < 8; ++j) {
+    // row_low
+    frag_O[j].x[0] *= row_scale_0;
+    frag_O[j].x[1] *= row_scale_0;
+    frag_O[j].x[4] *= row_scale_0;
+    frag_O[j].x[5] *= row_scale_0;
+
+    // row_high
+    frag_O[j].x[2] *= row_scale_1;
+    frag_O[j].x[3] *= row_scale_1;
+    frag_O[j].x[6] *= row_scale_1;
+    frag_O[j].x[7] *= row_scale_1;
+}
+
+// 5. exp + local sum
+float local_sum_0 = 0.0f;
+float local_sum_1 = 0.0f;
+
+#pragma unroll
+for (int j = 0; j < 4; ++j) {
+    // row_low
+    frag_S[j].x[0] = expf(frag_S[j].x[0] - m_now_0);
+    frag_S[j].x[1] = expf(frag_S[j].x[1] - m_now_0);
+    frag_S[j].x[4] = expf(frag_S[j].x[4] - m_now_0);
+    frag_S[j].x[5] = expf(frag_S[j].x[5] - m_now_0);
+
+    local_sum_0 += frag_S[j].x[0];
+    local_sum_0 += frag_S[j].x[1];
+    local_sum_0 += frag_S[j].x[4];
+    local_sum_0 += frag_S[j].x[5];
+
+    // row_high
+    frag_S[j].x[2] = expf(frag_S[j].x[2] - m_now_1);
+    frag_S[j].x[3] = expf(frag_S[j].x[3] - m_now_1);
+    frag_S[j].x[6] = expf(frag_S[j].x[6] - m_now_1);
+    frag_S[j].x[7] = expf(frag_S[j].x[7] - m_now_1);
+
+    local_sum_1 += frag_S[j].x[2];
+    local_sum_1 += frag_S[j].x[3];
+    local_sum_1 += frag_S[j].x[6];
+    local_sum_1 += frag_S[j].x[7];
+}
+
+// 6. quad 内 sum 规约
+local_sum_0 += __shfl_xor_sync(0xffffffff, local_sum_0, 1);
+local_sum_0 += __shfl_xor_sync(0xffffffff, local_sum_0, 2);
+
+local_sum_1 += __shfl_xor_sync(0xffffffff, local_sum_1, 1);
+local_sum_1 += __shfl_xor_sync(0xffffffff, local_sum_1, 2);
+
+// 7. update state
+l_prev[0] += local_sum_0;
+l_prev[1] += local_sum_1;
+
+m_prev[0] = m_now_0;
+m_prev[1] = m_now_1;
+
+
+
+// ------------------------------------------------------------------------
+            // 7. 【官方装甲空投】：取代脆弱的手工指针，使用 wmma 自带的拓扑映射
+            // ------------------------------------------------------------------------
+            // 【物理相变】：在寄存器中声明一半精度的累加器碎片
+            wmma::fragment<wmma::accumulator, 16, 16, 16, half> frag_P_half[4];
 
             #pragma unroll
-            for(int j = 0; j < 4; ++j){
-                wmma::store_matrix_sync(s_S_full_buffer + action_Q_offset * 64 + j * 16, frag_S[j], 64, wmma::mem_row_major);
-            }
-        
-        } //算S结束，已放回SK内存地址
-
-        __syncthreads();  //16KB的S矩阵全部保存在SmemK
-        
-
-
-
-
-        // 4. Online Softmax 
-        float* s_S_full_buffer = reinterpret_cast<float*>(s_K_ptr);  //重新指向SK是因为上一个是在括号里的，出了括号就无作用域了
-        const float scale_factor = 1.0f / sqrtf(128.0f);  //清洗数据做梯度消失的防爆处理，避免数值分布极度分散方差过大，刚搬来K就做清洗未必好因为当时是半精度
-        half p_temp[64]; //为了避免算出P和把P写回时内存竞争所以这两步必须分开做，所以每行64个P要先放在寄存器里
-        
-        // 它就在这，一直活在寄存器里就算进入if也会被更改
-        float row_scale = 1.0f; //先定义补偿指数
-
-        //只有进来的前64个线程知道每行的补偿row scale是多少（后续补偿历史O会用到
-        if (tid < 64) {
-            //放在循环里，只有有效的才会计算自己负责哪一行其他64个线程不会开销寄存器
-            float* my_row = s_S_full_buffer + tid * 64; // 每人处理一行
-            float m_local = -INFINITY;  //先定义出当前最大（用来算64个打分里谁最大）历史最大是prev
-            
-            //找局部最大值
-            #pragma unroll 4
-            for(int a = 0; a < 64; ++a){
-                my_row[a] *= scale_factor;
-                m_local = fmaxf(m_local, my_row[a]);  //本行里最大值
-            }
-
-            //Online核心,找到过去和现在谁是新最大值，产生动态补偿
-            float m_now = fmaxf(m_prev, m_local); 
-            
-            // 进if的64个线程的寄存器rowscale已被永久更新
-            row_scale = expf(m_prev - m_now);  //算出补偿值（e为底）
-            l_prev *= row_scale;               //补偿缩放历史的行和
-
-            float row_sum = 0.0f;           //定义当前行和
-            #pragma unroll 4
-            for(int a = 0; a < 64; ++a){
-
-                /*即使有了梯度防爆，但极深的神经网络中还是有可能面临大数据。假设S为1000，
-             在scale（约为11.3）后约为100，如果不减去最大会直接变为e的100次方，会撑爆数据类型的上限*/
-                float exp_val = expf(my_row[a] - m_now); //softMax中的数据保底防爆（打分减去当前行最大值）
-                p_temp[a] = __float2half(exp_val);       //先放在寄存器里，避免直接写回造成内存竞争
-                row_sum += exp_val;                     //卷走数据累计行和
-            }
-
-            l_prev += row_sum;     //把新旧行和累积起来
-            m_prev = m_now;        //更新历史行里的最大值
-
-        }  //online soft Max结束
-           //必须把sync放在if外，它的意义是让一个block的线程都到齐，但是if里只有64个线程
-        __syncthreads(); // 此时，S矩阵的历史使命彻底结束，可以将P写回了
-
-
-
-
-        // 写入P到s_K前8KB（强转half后只有8KB）
-        if (tid < 64) {
-            #pragma unroll 4
-            for(int a = 0; a < 64; ++a){
-                s_K_ptr[tid * 64 + a] = p_temp[a]; 
-            }
-        }
-        __syncthreads();//同步。必须等所有线程把数据写完了才走
-
-
-
-
-
-
-        // 5. 历史 O 补偿
-
-        //闲置的SV内存(16KB)在此处登场，用来存储然后缩放历史O矩阵，而由于O矩阵此时未归一化且是单精度（32KB）
-        //所以被迫重新引入phase分上下半场放入O矩阵做补偿
-        
-        float* s_O_buffer = reinterpret_cast<float*>(s_V_ptr); 
-
-        #pragma unroll
-
-        //搬运时是本半场的64个线程在搬，补偿时是32个对应行线程在计算
-        for(int phase = 0; phase < 2; ++phase){  //上下半场循环开始
-
-            bool is_my_time = (warp_id / 2 == phase); 
-            
-            //ismytime只控制谁搬运
-            if(is_my_time){
-
-                // 吐出历史的O
-                //每人负责16*128的历史O，所以搬8次即可
+            for (int j = 0; j < 4; ++j) {
+                // 寄存器内部强行精度相变：float -> half (绝不接触 Smem)
                 #pragma unroll
-                for(int j = 0; j < 8; ++j){
-                    int local_row = (warp_id % 2) * 16; //算自己负责哪16行（warp0得出0，在store时，Tensor Core会以0行0列开始搬数据，warp1是1，Tensor Core会在16行0列开始搬数据
-                    //因为上下半场搬运的数据不同了，即使warp02在同一个偏移下找数据，但数据已经变了
-                    int local_col = j * 16;             //控制搬运多少次
-                    wmma::store_matrix_sync(s_O_buffer + local_row * 128 + local_col, frag_O[j], 128, wmma::mem_row_major);
+                for(int i = 0; i < 8; ++i) {
+                    frag_P_half[j].x[i] = __float2half(frag_S[j].x[i]);
                 }
-            }
-
-            __syncthreads();
-
-
-
-            /* 每半场只负责32行的数据，而下半场搬运时是warp23在工作
-            但是下半场负责的32-63行的数据只有warp1的32个线程知道知道
-            上半场同理，只有warp0的32个线程知道rowscale是多少*/
-
-            if (tid >= phase * 32 && tid < (phase + 1) * 32) { //if判断会让前面参与OnlineSoftMax的线程取出本行的rowscale来补偿
-                int local_row = tid % 32;  //上下半场会算出一样的偏移（但是在前一个搬运阶段时说数据就不一样了会补偿到正确的行的）
-                //即下半场算出的第1行是补偿的第33行（前面吐出历史O时确保了不会补偿错）
-
-                float* my_O_row = s_O_buffer + local_row * 128;
                 
-                #pragma unroll 4
-                for(int c = 0; c < 128; ++c){
-                    my_O_row[c] *= row_scale; // 直接从寄存器砸向显存，零延迟，零碰撞
-                }
+                // 让硬件编译器接管物理寻址！彻底消灭拓扑错乱的可能！
+                // 完美写入 64x64 的 P 阵地
+                int store_row = action_Q_offset; // 0, 16, 32, 48
+                int store_col = j * 16;          // 0, 16, 32, 48
+                wmma::store_matrix_sync(s_K_ptr + store_row * 64 + store_col, frag_P_half[j], 64, wmma::mem_row_major);
             }
-
-            __syncthreads();  // 必须等每一个字都被补偿完
-
-
-
-            //补偿完后写回寄存器里存着
-            if(is_my_time){
-                #pragma unroll
-                for(int j = 0; j < 8; ++j){
-                    int local_row = (warp_id % 2) * 16;
-                    int local_col = j * 16;
-                    wmma::load_matrix_sync(frag_O[j], s_O_buffer + local_row * 128 + local_col, 128, wmma::mem_row_major);
-                }
-            }
-
-            __syncthreads(); 
-        } //历史补偿O结束。下一步算PV。
+    
+            __syncthreads(); // 【时间线缝合 3】必须等所有人都把 P 砸进去了，才能开始算 P*V！
 
 
 
@@ -440,13 +441,22 @@ __global__ void flash_atten_kernel(
     /* 卸磨杀驴与最终归一化
     复用最初的 Q 阵地，Q的生命周期只存在于算kchunk循环，等待KV循环完之后QKVSP都没用了可以复用内存做最终的归一化了*/
     float* s_O_dump = reinterpret_cast<float*>(smem); 
-    float* s_l_prev_dump = s_O_dump + (64 * 128); //从放O的内存往后512bytes，作为lPrev的公告板，每个线程捏着一个本行最终的历史行和
-
     
-    //前64个线程同时交出自己物理寄存器里的l_prev，钉在公告板上，因为要执行翻转轴心了
-    if (tid < 64) {
-        s_l_prev_dump[tid] = l_prev;
-    }
+#pragma unroll
+for (int j = 0; j < 8; ++j) {
+    // row_low
+    frag_O[j].x[0] /= l_prev[0];
+    frag_O[j].x[1] /= l_prev[0];
+    frag_O[j].x[4] /= l_prev[0];
+    frag_O[j].x[5] /= l_prev[0];
+
+    // row_high
+    frag_O[j].x[2] /= l_prev[1];
+    frag_O[j].x[3] /= l_prev[1];
+    frag_O[j].x[6] /= l_prev[1];
+    frag_O[j].x[7] /= l_prev[1];
+}
+
 
 
 
@@ -480,24 +490,23 @@ __global__ void flash_atten_kernel(
         
         /*现在tid不再表示一个线程负责一行了，现在表示一个线程负责一列，128个线程完整的负责了一行里的全部列
         1：根据 tid (列) 和 row (行) 从 Smem 中提取分子*/
-            float numerator = s_O_dump[row * 128 + tid];
+            float final_val = s_O_dump[row * 128 + tid];
 
 
         //知道了当前线程在哪一行和哪一行的数值还不够，还得知道当前行的历史行总和是多少
         //如果没有前面的写入Smem里共享的话，线程0存行0的行总和但当这个翻转轴心来到行0外时除了当时负责本行的线程根本没人知道这行的行和是多少而且也不能用因为是存在寄存器里的没法直接读也要经过Smem
         //2：从公告板中提取这一行专属的分母
-            float denominator = s_l_prev_dump[row];
+           
             
-            //本行的每一个数都除以本行的历史行和做归一化并且最终转变为半精度half型
-            half final_val = __float2half(numerator / denominator);
+          
 
         /*翻转轴心的奖励是完美的访存合并
         注意看指针偏移，同一个 Warp里的32个线程，此时row是一样的
         就表示它们的偏移全是global_O_base+tid。
         这意味着这32个线程在写回显存时，地址是绝对连续的 0,1,2...31，是完美的访存合并而原先按照每个线程负责一行时，32个线程是巨大的步长用cpu的话说就是极差的局部性
         GPU里的内存控制器会直接将它们打包成一次完美的32byteBurst写入操作*/
-            O[global_O_base + tid] = final_val; 
-        }  /将循环的每行O矩阵里的数据写回到显存去
+            O[global_O_base + tid] = __float2half(final_val); 
+        }  //将循环的每行O矩阵里的数据写回到显存去
 
 
 
