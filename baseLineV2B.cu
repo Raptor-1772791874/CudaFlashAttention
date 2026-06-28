@@ -176,18 +176,35 @@ __global__ void flash_atten_kernel(
         int KV_global_idx = k_chunk_start * num_heads + head_idx;  //计算当前线程在负责的token的哪个头里所以得加上这个头的数字为偏移（在显存排布里，token0的num_heads(一般是32个）个头是排在一起的然后才是token1的32个头所以我们要算它到底在哪个头上）
         const float4* K_f4 = reinterpret_cast<const float4*>(K + KV_global_idx * Head_Dim);  //乘以维度就是真实的内存地址
 
+
+        //在外部一次性算好循环不变量
+        int k_row_base=tid/16;  //算线程负责搬的float4在哪个token的行里（负责第0token即在0行）（虽然行数是在变但是每次只偏移8行的步长）
+        int k_col_offset=tid%16; //算线程负责搬运的float4任务属于本token里第几个要搬运的float4任务（线程负责搬运的本行float4的任务编号是永远不变的）
+
+        //一共1024个float4任务，而128个线程一次会搬走整个任务的1/8，提前算好偏移1次的步长
+        const int k_stride_8_rows=8*num_heads*f4_stride;
+
+        //算出本线程负责的float4在显存中的哪个位置，在Smem中的哪个位置
+         const float4* my_K_ptr=K_f4+ (num_heads*f4_stride)*k_row_base +k_col_offset;
+         float4* my_s_K_ptr=s_K_f4+tid;
+
+
+
+
         // 2. 搬运 K（V2A中要占用SV的内存所以此处不急着把V搬进来）
         #pragma unroll
         for(int i = 0; i < 8; ++i){        //一次搬走了8行所以只循环8次即可搬完
-            int index = i * 128 + tid;     //算1024个float4任务里我负责哪个
-            int token_offset = index / 16; //算线程负责搬哪个token的搬运任务
-            int Dim_offset = index % 16;   //算线程负责本行的哪一个float4任务
-            if(k_chunk_start + token_offset < seq_end){   //防止越界
-                int global_read_idx = token_offset * (num_heads * f4_stride) + Dim_offset;
-                s_K_f4[index] = K_f4[global_read_idx]; 
+                 
+            if(k_chunk_start + k_row_base + i * 8 < seq_end){   //防止越界
+                
+            //如果合法，就把Q地址里的东西解引用拿给SQ里去存储
+                my_s_K_ptr[i * 128] = my_K_ptr[i * k_stride_8_rows];
             } else {  //越界置0
-                s_K_f4[index] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                my_s_K_ptr[i * 128] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
+           // my_K_ptr += k_stride_8_rows;  //往前推进8行在K里的真实偏移量
+            //my_s_K_ptr += 128;  //往前推进128个float4的偏移为下次循环准备
+
         }  //K搬运结束
 
         __syncthreads();  //同步锁
@@ -404,7 +421,7 @@ __global__ void flash_atten_kernel(
 
 
 
-            // 7. 取代脆弱的古法指针，使用wmma自带的拓扑映射
+            // 7. 取代古法指针，使用wmma自带的拓扑映射
            
             // 声明P矩阵半精度（直接在寄存器里就转化为半精度搬回Smem时省力）
             wmma::fragment<wmma::accumulator, 16, 16, 16, half> frag_P_half[4];
@@ -434,19 +451,30 @@ __global__ void flash_atten_kernel(
 
         // 6. 搬运 V 
         const float4* V_f4 = reinterpret_cast<const float4*>(V + KV_global_idx * Head_Dim);
+
+        int v_row_base=tid/16;  //负责哪行token
+        int v_col_offset=tid%16; //负责本行token的哪个float4任务
+
+
+        //算出取一轮后，下一轮偏移多少内存地址
+        const int v_stride_8_rows=8*num_heads*f4_stride;
+        const float4* my_V_ptr=V_f4 +(v_row_base*num_heads*f4_stride) +v_col_offset;  //计算该在哪个位置取数据
+        float4* my_s_V_ptr=s_V_f4+tid;                                                //计算自己该放在哪个位置上
+
+
         #pragma unroll
         for(int i = 0; i < 8; ++i){  // 128人在8轮里就能吃完64x128的V
-            int index = i * 128 + tid;  //与K搬运一致
-            int token_offset = index / 16;
-            int Dim_offset = index % 16;
 
-            if(k_chunk_start + token_offset < seq_end){ //防越界
-                int global_read_idx = token_offset * (num_heads * f4_stride) + Dim_offset;
-                s_V_f4[index] = V_f4[global_read_idx]; 
+            if(k_chunk_start + v_row_base+i*8 < seq_end){ //防越界
+               
+                my_s_V_ptr[i*128] = my_V_ptr[i*v_stride_8_rows]; 
             } else {
-                s_V_f4[index] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                my_s_V_ptr[i*128] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
-        }
+
+           // my_V_ptr+=v_stride_8_rows;  //128人搬完一次后加上偏移往前走
+            //my_s_V_ptr+=128;           //加上偏移
+        } //V搬运结束
         __syncthreads();  // 必须等V矩阵全员躺在s_V_ptr里
 
 
