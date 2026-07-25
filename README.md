@@ -1,6 +1,6 @@
 Varlen Flash Attention CUDA 从零实现
 自学 5 个月完成的工业级精度 Flash Attention 前向内核，完整支持变长序列，精度与 PyTorch 原生完全对齐
-✅ V1 终极版（基线实现）
+✅ V2B 终极版（基线实现）
 核心功能
 完整的 Varlen 变长序列支持（基于 cu_seqlens 前缀和）
 基于 WMMA 的 Tensor Core 加速（FP16）
