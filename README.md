@@ -16,7 +16,7 @@ FP32 最大误差：0.0002927184
 FP32 平均误差：3.1210e-06
 ✅ 无 NaN，无 Inf，与 PyTorch 原生 Attention 输出完全对齐
 性能基准
-表格
+
 实现	         序列长度	头维度	前向耗时	相对 PyTorch SDPA
 PyTorch SDPA	128	128	0.014 ms	100%
 本项目 V1	128	128	0.062 ms	22.6%
@@ -29,74 +29,79 @@ PyTorch SDPA	128	128	0.014 ms	100%
 ✅ 二分查找批次边界：长序列查找耗时减少 90%
 ✅ 移除冗余同步：去掉 3 个不必要的全局同步
 性能基准
-表格
+
 实现	         序列长度	头维度	前向耗时	相对 PyTorch SDPA
-PyTorch SDPA	128	128	0.0214 ms	100%
-本项目 V1.5	128	128	0.028 ms	76%
 PyTorch SDPA	1024	128	0.0334 ms	100%
 本项目 V1.5	1024	128	0.0828 ms	40%
-快速开始
 
+快速开始：
 路线图
- V1: 单 tile 基线实现 + 变长序列支持
- V1.5: Online Softmax + 访存优化
- V2: 64x64 分块 + 寄存器内规约
- V2.5: 异步拷贝 + 双缓冲流水线
- V3: FP8 精度支持
+ V1: 单 tile 基线实现 
+ V1.5: Online Softmax + 访存优化 + 变长序列支持
+ V2A: 64x128 分块 + 重构部分OnlineSoftMax代码逻辑
+ V2.5B: 实现寄存器内规约S，以warplevel级原语做蝴蝶洗牌规约历史O矩阵
+ V3: 预计做异步拷贝 + 双缓冲
  V4: 反向传播实现
 关于我
 正在寻找深圳地区CUDA 算子开发 / 大模型推理优化实习岗位。
-自学 CUDA 5 个月，从零实现完整 Flash Attention 内核
+自学 CUDA 7 个月，从零实现完整 Flash Attention 内核
 擅长 GPU 底层优化、Tensor Core 编程、高性能计算
 邮箱：fuzhangsheng89@gmail.com / 1772791874@qq.com
 GitHub：https://github.com/Raptor-1772791874/CudaFlashAttention
 
-Varlen Flash Attention from Scratch
-Industrial-grade Flash Attention forward kernel implemented from scratch in CUDA, with exact numerical alignment to PyTorch native implementation
-✅ V1 Final (Baseline Implementation)
-Core Features
-Full variable-length sequence support (based on cu_seqlens prefix sum)
-Tensor Core acceleration via WMMA (FP16)
-4-warp tiling for 128x128 S matrix computation
-float4 vectorized global memory loading
-Zero-overhead K matrix transpose
-Complete Softmax computation with numerical stability handling
-Accuracy Verification (Industrial Standard)
+ Varlen Flash Attention CUDA Implementation from Scratch
+An industrial-precision forward kernel for Flash Attention completed over 7 months of self-study, with full support for variable-length sequences and numerically identical outputs to native PyTorch implementation.
+
+ ✅ Ultimate V2B Version (Baseline Implementation)
+ Core Features
+- Full variable-length sequence support via cumulative sequence length prefix sums (`cu_seqlens`)
+- Tensor Core acceleration with WMMA intrinsics for FP16 computation
+- 128×128 S matrix blocked computation across 4 warps
+- Vectorized global memory loading using `float4`
+- Zero-overhead transposition of the K matrix
+- Complete Softmax computation with numerical stability safeguards
+
+ Industrial-Grade Precision Validation
 Test Environment: RTX 5090 32GB, CUDA 12.8, PyTorch 2.4
-FP16 max error: 0.00048828125
-FP16 mean error: 2.9385e-05
-FP32 max error: 0.0002927184
-FP32 mean error: 3.1210e-06
-✅ No NaN, no Inf, exact numerical alignment with PyTorch native Attention
-Performance Benchmark
-表格
-Implementation	Sequence Length	Head Dim	Forward Latency	Relative to PyTorch SDPA
-PyTorch SDPA	128	128	0.014 ms	100%
-This Project V1	128	128	0.062 ms	22.6%
-🚀 V1.5(OnlineSoftMax) Release (June 10, 2026)
-Key Optimizations
-✅ Online Softmax: Eliminated global SMEM storage for S matrix, 3x faster on long sequences
-✅ Strict Register Lifecycle Control: Reduced register spill by 60%
-✅ Delayed V Loading: Doubled SMEM utilization from 4 tiles to 3 tiles
-✅ Transposed Axis Writeback: Achieved 100% memory coalescing, reduced write latency by 80%
-✅ Binary Search for Batch Boundaries: Reduced long sequence lookup time by 90%
-✅ Removed Redundant Synchronizations: Eliminated 3 unnecessary global barriers
-Performance Benchmark
-表格
-Implementation	Sequence Length	Head Dim	Forward Latency	Relative to PyTorch SDPA
-PyTorch SDPA	128	128	0.0214 ms	100%
-This Project V1.5	128	128	0.028 ms	76%
-PyTorch SDPA	1024	128	0.0334 ms	100%
-This Project V1.5	1024	128	0.0828 ms	40%
+- FP16 Max Absolute Error: 0.00048828125
+- FP16 Mean Absolute Error: 2.9385e-05
+- FP32 Max Absolute Error: 0.0002927184
+- FP32 Mean Absolute Error: 3.1210e-06
 
-Quick Start
+✅ Zero NaNs, zero Infs, fully aligned outputs with PyTorch native Attention
 
- V1: Single-tile baseline + variable-length support
- V1.5: Online Softmax + memory access optimizations
- V2: 64x64 tiling + register-level reduction
- V2.5: Async copy + double buffering pipeline
- V3: FP8 precision support
- V4: Backward pass implementation
+ Performance Benchmark
+| Implementation | Seq Length | Head Dim | Forward Latency | Relative to PyTorch SDPA |
+|----------------|------------|----------|-----------------|-------------------------|
+| PyTorch SDPA   | 128        | 128      | 0.014 ms        | 100%                    |
+| Our Project V1 | 128        | 128      | 0.062 ms        | 22.6%                   |
+
+ 🚀 V1.5 Official Release (OnlineSoftMax) | Released Jun 10, 2026
+ Core Optimizations
+- Online Softmax: Eliminates full S matrix storage in shared memory (SMEM), delivering 3× performance boost for long sequences
+- Enforced register lifetime via brace scoping: 60% reduction in register spilling
+- Lazy V matrix loading: Doubled SMEM utilization, reduced required blocks from 4 to 3
+- Axis-flipped writeback scheme: 100% coalesced global memory access, 80% lower write latency
+- Binary search for batch boundaries: 90% reduction in long-sequence boundary lookup overhead
+- Redundant barrier elimination: Removed 3 unnecessary global thread block synchronizations
+
+ Performance Benchmark
+| Implementation | Seq Length | Head Dim | Forward Latency | Relative to PyTorch SDPA |
+|----------------|------------|----------|-----------------|-------------------------|
+| PyTorch SDPA   | 1024       | 128      | 0.0334 ms       | 100%                    |
+| Our Project V1.5 | 1024     | 128      | 0.0828 ms       | 40%                     |
+
+ Quick Start
+*(Reserved for subsequent documentation)*
+
+ Roadmap
+- V1: Single-tile baseline implementation
+- V1.5: Online Softmax + memory access optimization + variable-length sequence support
+- V2A: 64×128 tiling + refactored OnlineSoftMax logic
+- V2.5B: In-register reduction for S matrix, warp-level butterfly shuffle reduction for historical O matrix
+- V3: Planned asynchronous copy + double buffering optimization
+- V4: Backward pass implementation
+
 About Me
 Looking for full-time positions in Shenzhen in CUDA kernel development / large model inference optimization.
 Self-taught CUDA for 5 months, implemented complete Flash Attention kernel from scratch
